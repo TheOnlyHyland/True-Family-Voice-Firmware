@@ -7,14 +7,14 @@
 # a small per-device stub, so updates are one click in the dashboard (no more
 # copy-pasting the whole file). The stub provides the device identity + secrets
 # as SUBSTITUTIONS (a remote package can't use !secret):
-#   name, friendly_name, wifi_ssid, wifi_password, ota_password, api_key
+#   name, friendly_name, wifi_ssid, wifi_password, ota_password
 #   (+ static_ip/gateway/subnet/dns1/dns2 and a manual_ip override for a fixed IP)
 # See esphome-builder.dhcp.yaml in this repo for the stub template.
 # ============================================================================
 substitutions:
   # Device identity comes from the per-device stub (esphome-builder.dhcp.yaml); these
   # are safe defaults the stub overrides. Wi-Fi + secrets (wifi_ssid, wifi_password,
-  # ota_password, api_key) MUST be provided by the stub as substitutions, because
+  # ota_password) MUST be provided by the stub as substitutions, because
   # a remote `packages:` include can't use !secret.
   name: home-assistant-voice
   friendly_name: Home Assistant Voice
@@ -194,8 +194,6 @@ ota:
 # ESPHome advertises _esphomelib over mDNS automatically, so the old manual
 # mdns workaround is no longer needed.
 api:
-  encryption:
-    key: ${api_key}
   # va-direct: start micro_wake_word HERE (mirrors stock home-assistant-voice.yaml
   # and the fjfricke reference) instead of on_boot. Starting mWW at on_boot+1s
   # raced the XMOS voice-kit coming up, so mWW could begin reading a mic that

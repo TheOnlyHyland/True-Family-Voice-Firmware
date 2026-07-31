@@ -8,7 +8,7 @@
 #
 #   1. Set `name` / `friendly_name` for your device.
 #   2. Put the keys below in your ESPHome secrets.yaml (Builder -> Secrets):
-#        wifi_ssid, wifi_password, ota_password, api_key
+#        wifi_ssid, wifi_password, ota_password
 #   3. Install once. After that, click Update whenever a new version ships.
 # ============================================================================
 substitutions:
@@ -18,7 +18,6 @@ substitutions:
   wifi_ssid: !secret wifi_ssid
   wifi_password: !secret wifi_password
   ota_password: !secret ota_password
-  api_key: !secret api_key
 
 # Long form ON PURPOSE: the github:// shorthand has no refresh option, and
 # ESPHome then caches the downloaded yaml for a DAY -- clicking Update right

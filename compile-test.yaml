@@ -4,7 +4,6 @@ substitutions:
   wifi_ssid: "compile-only"
   wifi_password: "compile-only-password"
   ota_password: "compile-only-ota-password"
-  api_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
   va_url: "ws://192.0.2.1:8080/"
 
 packages:
