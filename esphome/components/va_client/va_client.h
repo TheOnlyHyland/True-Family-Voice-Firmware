@@ -110,6 +110,7 @@ class VaClient : public Component {
   // stale pre-wake segment → backend suppresses its thinking + cancels its
   // garbage response. Sent on every start_session(); old backends ignore it.
   void send_wake_();
+  void send_graceful_close_ack_(const char *stage, uint32_t token, bool accepted);
   // Mic pre-roll helper (mic-task only, no lock). push appends to the rolling
   // ring while the session is closed; the ring is DISCARDED (not replayed) on
   // session open — see preroll_discard_pending_.
@@ -231,6 +232,11 @@ class VaClient : public Component {
   // doesn't trigger a follow-up mic window. The user explicitly asked us to
   // stop — they don't want the device sitting there listening.
   bool suppress_followup_{false};
+  // Two-phase, token-bound model close, separate from hard Stop. Prepare never
+  // closes anything; a matching commit during the same active turn arms the
+  // token that loop() consumes after the final reply drains.
+  std::atomic_uint32_t graceful_close_prepared_token_{0};
+  std::atomic_uint32_t graceful_close_token_{0};
   // Set by send_interrupt() ("stop" word / barge-in). OpenAI bursts the whole
   // reply faster than real-time, so by the time the user says "stop" the audio
   // is already buffered (backend + our PSRAM) and the backend keeps streaming

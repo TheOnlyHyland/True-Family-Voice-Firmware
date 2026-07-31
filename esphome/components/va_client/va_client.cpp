@@ -245,10 +245,26 @@ void VaClient::loop() {
                  (unsigned) kSpeakerStopTimeoutMs);
       }
       this->waiting_for_speaker_stop_ = false;
-      const bool was_request = this->request_follow_up_pending_;
+      const uint32_t graceful_close_token = this->graceful_close_token_.load();
+      const bool was_request =
+          this->request_follow_up_pending_ && graceful_close_token == 0;
       this->followup_pending_ = false;
       this->request_follow_up_pending_ = false;
-      if (was_request) {
+      if (graceful_close_token != 0) {
+        // has_buffered_data() excludes the final i2s/DAC tail. Keep the device
+        // in replying through the same tail delay used before a normal follow-up.
+        this->followup_armed_ = false;
+        const uint32_t tail_delay = this->followup_open_delay_ms_;
+        ESP_LOGI(TAG, "graceful close — final buffers drained; idle in %u ms",
+                 (unsigned) tail_delay);
+        this->set_timeout("va_graceful_close", tail_delay, [this, graceful_close_token]() {
+          uint32_t expected = graceful_close_token;
+          if (!this->graceful_close_token_.compare_exchange_strong(expected, 0))
+            return;
+          ESP_LOGI(TAG, "graceful close complete — follow-up suppressed");
+          this->open_followup_window_(0);
+        });
+      } else if (was_request) {
         // Request-driven path: speaker has drained, now hand off to yaml
         // for the chime → wait_until !is_announcing → commit_followup_mic
         // sequence (announcement lane is separate from the TTS lane we
@@ -495,6 +511,54 @@ void VaClient::handle_text_(const char *data, size_t len) {
              (unsigned) this->audio_fill_);
     this->followup_pending_ = true;
     this->request_follow_up_pending_ = true;
+    return;
+  }
+
+  if (msg.find("\"type\":\"prepare_suppress_followup\"") != std::string::npos) {
+    uint32_t token = 0;
+    const bool has_token = parse_uint_after_key(msg, "\"token\":", token) && token != 0;
+    const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
+    const bool accepted = has_token &&
+                          (phase_now == Phase::THINKING || phase_now == Phase::REPLYING);
+    if (accepted) {
+      this->graceful_close_prepared_token_ = token;
+      ESP_LOGI(TAG, "graceful close prepared (token=%u)", (unsigned) token);
+    } else {
+      ESP_LOGW(TAG, "graceful close prepare rejected in phase=%s", phase_name_(phase_now));
+    }
+    this->send_graceful_close_ack_("prepared", token, accepted);
+    return;
+  }
+
+  if (msg.find("\"type\":\"commit_suppress_followup\"") != std::string::npos) {
+    uint32_t token = 0;
+    const bool has_token = parse_uint_after_key(msg, "\"token\":", token) && token != 0;
+    const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
+    const bool accepted = has_token &&
+                          this->graceful_close_prepared_token_.load() == token &&
+                          (phase_now == Phase::THINKING || phase_now == Phase::REPLYING);
+    if (accepted) {
+      this->graceful_close_prepared_token_ = 0;
+      this->graceful_close_token_ = token;
+      ESP_LOGI(TAG, "graceful close committed (token=%u)", (unsigned) token);
+    } else {
+      ESP_LOGW(TAG, "graceful close commit rejected in phase=%s", phase_name_(phase_now));
+    }
+    this->send_graceful_close_ack_("committed", token, accepted);
+    return;
+  }
+
+  if (msg.find("\"type\":\"cancel_suppress_followup\"") != std::string::npos) {
+    uint32_t token = 0;
+    if (parse_uint_after_key(msg, "\"token\":", token) && token != 0) {
+      if (this->graceful_close_prepared_token_.load() == token)
+        this->graceful_close_prepared_token_ = 0;
+      if (this->graceful_close_token_.load() == token) {
+        this->graceful_close_token_ = 0;
+        this->cancel_timeout("va_graceful_close");
+      }
+      ESP_LOGI(TAG, "graceful close cancelled (token=%u)", (unsigned) token);
+    }
     return;
   }
 
@@ -802,6 +866,10 @@ void VaClient::set_phase_(const std::string &phase) {
   //                without re-triggering the wake word. Timer expiry closes
   //                the session.
   if (phase == "listening") {
+    // A genuine new user turn wins over any stale or late model close request.
+    this->graceful_close_prepared_token_ = 0;
+    this->graceful_close_token_ = 0;
+    this->cancel_timeout("va_graceful_close");
     if (!this->streaming_) {
       ESP_LOGI(TAG, "phase=listening — mic streaming on");
       this->streaming_ = true;
@@ -846,6 +914,7 @@ void VaClient::set_phase_(const std::string &phase) {
     this->cancel_timeout("va_followup");
     this->cancel_timeout("va_followup_open");
     this->cancel_timeout("va_tts_tail");
+    this->cancel_timeout("va_graceful_close");
     this->cancel_timeout("va_no_speech");
     this->followup_pending_ = false;
     this->waiting_for_speaker_stop_ = false;
@@ -902,6 +971,16 @@ void VaClient::set_phase_(const std::string &phase) {
       this->followup_armed_ = false;
       this->cancel_timeout("va_tts_tail");
       this->idle_emit_pending_ = false;
+    } else if (this->graceful_close_token_.load() != 0) {
+      // The model judged this exchange complete. Keep the mic closed and defer
+      // idle until the same speaker-drain path used by ordinary follow-ups.
+      this->streaming_ = false;
+      this->followup_pending_ = true;
+      this->waiting_for_speaker_stop_ = false;
+      this->request_follow_up_pending_ = false;
+      this->followup_armed_ = false;
+      this->idle_emit_pending_ = true;
+      return;
     } else if (this->audio_fill_ == 0) {
       // Stale-`idle` guard. prev==REPLYING with NO audio played since the last
       // wake (turn_t_first_audio_out_==0) means this `idle` belongs to a reply
@@ -1032,6 +1111,8 @@ void VaClient::start_session() {
   this->followup_armed_ = false;
   this->idle_emit_pending_ = false;
   this->suppress_followup_ = false;
+  this->graceful_close_prepared_token_ = 0;
+  this->graceful_close_token_ = 0;
   // A genuine new turn starts here — drop the post-stop `thinking` guard so
   // this turn's `thinking` shows normally. (Set last, AFTER the residual-reply
   // send_interrupt() above re-set it, so the wake always ends with it clear.)
@@ -1039,6 +1120,7 @@ void VaClient::start_session() {
   this->cancel_timeout("va_followup");
   this->cancel_timeout("va_followup_open");
   this->cancel_timeout("va_tts_tail");
+  this->cancel_timeout("va_graceful_close");
   // Anchor turn-latency timestamps for the new turn.
   this->turn_t_wake_ = millis();
   this->turn_t_listening_ = 0;
@@ -1166,12 +1248,15 @@ void VaClient::enroll_start() {
   this->cancel_timeout("va_followup");
   this->cancel_timeout("va_followup_open");
   this->cancel_timeout("va_tts_tail");
+  this->cancel_timeout("va_graceful_close");
   this->followup_pending_ = false;
   this->waiting_for_speaker_stop_ = false;
   this->request_follow_up_pending_ = false;
   this->followup_armed_ = false;
   this->idle_emit_pending_ = false;
   this->suppress_followup_ = false;
+  this->graceful_close_prepared_token_ = 0;
+  this->graceful_close_token_ = 0;
   this->post_stop_guard_ = false;
   this->suppress_incoming_audio_ = false;
   this->preroll_discard_pending_ = true;
@@ -1254,6 +1339,19 @@ void VaClient::send_wake_() {
     esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
     ESP_LOGI(TAG, "wake — sent {\"type\":\"wake\"} (dangling-VAD guard)");
   }
+}
+
+void VaClient::send_graceful_close_ack_(const char *stage, uint32_t token, bool accepted) {
+  std::string ack = "{\"type\":\"suppress_followup_ack\",\"stage\":\"";
+  ack += stage;
+  ack += "\",\"token\":" + std::to_string(token);
+  ack += accepted ? ",\"accepted\":true}" : ",\"accepted\":false}";
+  this->defer([this, ack]() {
+    if (!this->ws_connected_ || this->ws_handle_ == nullptr)
+      return;
+    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+    esp_websocket_client_send_text(handle, ack.c_str(), ack.size(), portMAX_DELAY);
+  });
 }
 
 void VaClient::fire_phase_led_(const std::string &phase) {
@@ -1344,9 +1442,12 @@ void VaClient::send_interrupt() {
   this->cancel_timeout("va_no_speech");
   this->cancel_timeout("va_followup");
   this->cancel_timeout("va_tts_tail");
+  this->cancel_timeout("va_graceful_close");
   // The phase=idle the server is about to send shouldn't open a follow-up
   // mic window — the user said "stop", not "wait for me to keep talking".
   this->suppress_followup_ = true;
+  this->graceful_close_prepared_token_ = 0;
+  this->graceful_close_token_ = 0;
   // Mic gate is now closed: no new turn can begin until a wake. Ignore any
   // `thinking` the backend emits in the meantime — it's the server VAD's
   // end-of-turn for the utterance we just cancelled, not a real new turn.
