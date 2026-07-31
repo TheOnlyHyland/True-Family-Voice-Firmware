@@ -593,6 +593,10 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
     float vol = this->volume_;
     if (vol < 0.0f) vol = 0.0f;
     else if (vol > 1.0f) vol = 1.0f;
+    // The Voice PE's acoustic echo cancellation is imperfect at high speaker
+    // volume. Keep enough headroom for reliable handsfree barge-in and avoid
+    // feeding the assistant's own reply back into server VAD.
+    if (this->barge_in_ && vol > 0.70f) vol = 0.70f;
     // Q15 fixed point so the inner loop stays integer-only.
     int32_t scale = static_cast<int32_t>(vol * 32768.0f);
     uint32_t clipped = 0;

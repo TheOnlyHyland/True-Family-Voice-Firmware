@@ -177,7 +177,7 @@ network:
   enable_ipv6: true
 
 logger:
-  level: DEBUG
+  level: INFO
   logs:
     sensor: WARN # avoids logging debug sensor updates
 
@@ -386,7 +386,7 @@ switch:
     icon: "mdi:bullhorn"
     entity_category: config
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
+    restore_mode: RESTORE_DEFAULT_OFF
   # Internal switch to track when a timer is ringing on the device.
   - platform: template
     id: timer_ringing
@@ -2032,15 +2032,9 @@ va_client:
   url: ${va_url}
   microphone: i2s_mics
   mic_channel: 0
-  # Handsfree barge-in: keep the mic open while the assistant is speaking so
-  # you can talk over it and the backend's server VAD will cut the reply off.
-  # Relies on the XMOS AEC to suppress speaker->mic echo (imperfect — see
-  # CLAUDE.md). DISABLED: on this hardware the ~10x speaker->mic leak fed back
-  # into the open mic during the reply, the (semantic) VAD flapped
-  # listening<->thinking and once built into a loud acoustic-feedback squeal.
-  # false = original turn-based behaviour (mic closed while replying; interrupt
-  # only via the "stop" word or the center button) — clean turns, no feedback.
-  barge_in: false
+  # Handsfree barge-in keeps the AEC microphone stream open while the assistant
+  # speaks so Realtime server VAD can cancel the reply when the user talks.
+  barge_in: true
   # Write raw PCM16 mono 24kHz into the media resampler. We can't share the
   # announcement lane with external_media_player — va_client grabs the
   # resampling speaker on setup and holds it, which prevents the upstream
