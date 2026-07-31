@@ -12,7 +12,7 @@
 #   3. Install once. After that, click Update whenever a new version ships.
 # ============================================================================
 substitutions:
-  name: my-voice-pe                  # your device's name -- keep it stable!
+  name: my-voice-pe # your device's name -- keep it stable!
   friendly_name: Home Assistant Voice
   # Secrets -> substitutions (a remote package can't use !secret directly):
   wifi_ssid: !secret wifi_ssid
@@ -26,13 +26,13 @@ substitutions:
 # every compile fetch the latest release.
 packages:
   realtime:
-    url: https://github.com/TristanBrotherton/voicepe-realtime-firmware
+    url: https://github.com/TheOnlyHyland/True-Family-Voice-Firmware
     ref: main
     files: [home-assistant-voice.realtime.yaml]
     refresh: 0s
 
 dashboard_import:
-  package_import_url: github://TristanBrotherton/voicepe-realtime-firmware/home-assistant-voice.realtime.yaml@main
+  package_import_url: github://TheOnlyHyland/True-Family-Voice-Firmware/home-assistant-voice.realtime.yaml@main
   import_full_config: false
 
 # --- Fixed (static) IP? -----------------------------------------------------

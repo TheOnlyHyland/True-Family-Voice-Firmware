@@ -21,31 +21,31 @@ substitutions:
 
   # Phases of the Voice Assistant
   # The voice assistant is ready to be triggered by a wake word
-  voice_assist_idle_phase_id: '1'
+  voice_assist_idle_phase_id: "1"
   # The voice assistant is waiting for a voice command (after being triggered by the wake word)
-  voice_assist_waiting_for_command_phase_id: '2'
+  voice_assist_waiting_for_command_phase_id: "2"
   # The voice assistant is listening for a voice command
-  voice_assist_listening_for_command_phase_id: '3'
+  voice_assist_listening_for_command_phase_id: "3"
   # The voice assistant is currently processing the command
-  voice_assist_thinking_phase_id: '4'
+  voice_assist_thinking_phase_id: "4"
   # The voice assistant is replying to the command
-  voice_assist_replying_phase_id: '5'
+  voice_assist_replying_phase_id: "5"
   # The device is in voice-enrollment mode (fork): mic pinned open, recording
-  voice_assist_enrolling_phase_id: '6'
+  voice_assist_enrolling_phase_id: "6"
   # DEFAULT WAKE WORD: "HEY LEONARD" — a custom model trained by this project
   # (see models/ and the README). Switch to Hey Jarvis / Okay Nabu at runtime
   # via the device's "Wake word" dropdown in Home Assistant — no reflash.
-  wake_word_model: "github://TristanBrotherton/voicepe-realtime-firmware/models/hey_leonard.json@main"
+  wake_word_model: "github://TheOnlyHyland/True-Family-Voice-Firmware/models/hey_leonard.json@main"
   default_wake_word: "Hey Leonard"
   # Runtime sensitivity cutoffs (uint8 = round(p*255)) for Slightly/Moderately/
   # Very. Stock-model defaults; custom models override with calibrated values.
-  wake_cutoff_slight: '217'
-  wake_cutoff_moderate: '178'
-  wake_cutoff_very: '140'
+  wake_cutoff_slight: "217"
+  wake_cutoff_moderate: "178"
+  wake_cutoff_very: "140"
   # The voice assistant is not ready
-  voice_assist_not_ready_phase_id: '10'
+  voice_assist_not_ready_phase_id: "10"
   # The voice assistant encountered an error
-  voice_assist_error_phase_id: '11'
+  voice_assist_error_phase_id: "11"
   # Change this to true in case you ahve a hidden SSID at home.
   hidden_ssid: "false"
   # Substitutions for audio files
@@ -55,7 +55,7 @@ substitutions:
   mute_switch_off_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_off.flac
   # Gentle two-tone bell (synthesized, ~-14 dBFS) — the stock ring was "a
   # little intense" for a kitchen. Original: .../esphome/home-assistant-voice-pe/raw/dev/sounds/timer_finished.flac
-  timer_finished_sound_file: https://raw.githubusercontent.com/TristanBrotherton/voicepe-realtime-firmware/main/sounds/gentle_timer.flac
+  timer_finished_sound_file: https://raw.githubusercontent.com/TheOnlyHyland/True-Family-Voice-Firmware/main/sounds/gentle_timer.flac
   wake_word_triggered_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
   center_button_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_press.flac
   center_button_double_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_double_press.flac
@@ -140,7 +140,7 @@ esp32:
       CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
 
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
-      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"  # TLS1.3 support isn't enabled by default in IDF 5.1.5
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y" # TLS1.3 support isn't enabled by default in IDF 5.1.5
 
 wifi:
   id: wifi_id
@@ -158,7 +158,7 @@ wifi:
   ap:
     ssid: "Voice PE Setup"
   on_connect:
-    - delay: 5s  # give improv results time to transmit
+    - delay: 5s # give improv results time to transmit
     - ble.disable:
     - lambda: id(improv_ble_in_progress) = false;
     - script.execute: control_leds
@@ -179,8 +179,7 @@ network:
 logger:
   level: DEBUG
   logs:
-    sensor: WARN  # avoids logging debug sensor updates
-
+    sensor: WARN # avoids logging debug sensor updates
 
 ota:
   - platform: esphome
@@ -269,24 +268,24 @@ i2c:
 psram:
   mode: octal
   speed: 80MHz
-  ignore_not_found: false  # The VPE has PSRAM, so this is safe. Allows configuring WiFi driver to use more resources (done automatically by the speaker media player)
+  ignore_not_found: false # The VPE has PSRAM, so this is safe. Allows configuring WiFi driver to use more resources (done automatically by the speaker media player)
 
 globals:
   # Global index for our LEDs. So that switching between different animation does not lead to unwanted effects.
   - id: global_led_animation_index
     type: int
     restore_value: no
-    initial_value: '0'
+    initial_value: "0"
   # Global initialization variable. Initialized to true and set to false once everything is connected. Only used to have a smooth "plugging" experience
   - id: init_in_progress
     type: bool
     restore_value: no
-    initial_value: 'true'
+    initial_value: "true"
   # Global variable storing the state of ImprovBLE. Used to draw different LED animations
   - id: improv_ble_in_progress
     type: bool
     restore_value: no
-    initial_value: 'false'
+    initial_value: "false"
   # Global variable tracking the phase of the voice assistant (defined above). Initialized to not_ready
   - id: voice_assistant_phase
     type: int
@@ -296,34 +295,34 @@ globals:
   - id: dial_touched
     type: bool
     restore_value: no
-    initial_value: 'false'
+    initial_value: "false"
   # Global variable tracking if the LED color was recently changed.
   - id: color_changed
     type: bool
     restore_value: no
-    initial_value: 'false'
+    initial_value: "false"
   # Global variable tracking if the group media player volume was recent changed.
   - id: group_volume_changed
     type: bool
     restore_value: no
-    initial_value: 'false'
+    initial_value: "false"
   # Global variable tracking if the jack has been plugged touched.
   - id: jack_plugged_recently
     type: bool
     restore_value: no
-    initial_value: 'false'
+    initial_value: "false"
   # Global variable tracking if the jack has been unplugged touched.
   - id: jack_unplugged_recently
     type: bool
     restore_value: no
-    initial_value: 'false'
+    initial_value: "false"
   # Global variable storing the first active timer
   # TODO va-direct: was voice_assistant::Timer — that type lives in the HA voice_assistant component
   # which we removed. Replace with bool placeholder until va_client exposes timer info.
   - id: first_active_timer
     type: bool
     restore_value: false
-    initial_value: 'false'
+    initial_value: "false"
   # Global variable storing if a timer is active
   - id: is_timer_active
     type: bool
@@ -332,7 +331,7 @@ globals:
   - id: factory_reset_requested
     type: bool
     restore_value: no
-    initial_value: 'false'
+    initial_value: "false"
 
 switch:
   # This is the master mute switch. It is exposed to Home Assistant. The user can only turn it on and off if the hardware switch is off. (The hardware switch overrides the software one)
@@ -377,7 +376,7 @@ switch:
               return id(voice_assistant_phase) == ${voice_assist_waiting_for_command_phase_id} ||
                      id(voice_assistant_phase) == ${voice_assist_listening_for_command_phase_id};
           then:
-            - lambda: 'id(va)->send_interrupt();'
+            - lambda: "id(va)->send_interrupt();"
             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
       - script.execute: control_leds
     on_turn_off:
@@ -430,7 +429,7 @@ switch:
       - micro_wake_word.enable_model: stop
       # B3: a timer ring is loud audio → use the stricter ~0.50 (128), same as a
       # reply (single shared cutoff on id(stop), so set it explicitly here).
-      - lambda: 'id(stop).set_probability_cutoff(128);'
+      - lambda: "id(stop).set_probability_cutoff(128);"
       # Ring timer
       - script.execute: ring_timer
       # Refresh LED
@@ -491,9 +490,9 @@ binary_sensor:
                 # stop recording, notify the backend, back to idle.
                 - if:
                     condition:
-                      lambda: 'return id(va)->enroll_active();'
+                      lambda: "return id(va)->enroll_active();"
                     then:
-                      - lambda: 'id(va)->enroll_stop(true);'
+                      - lambda: "id(va)->enroll_stop(true);"
                       - script.execute: control_leds
                 - if:
                     condition:
@@ -516,13 +515,13 @@ binary_sensor:
                             # leaving the assistant talking.)
                             - if:
                                 condition:
-                                  lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id};'
+                                  lambda: "return id(voice_assistant_phase) != ${voice_assist_idle_phase_id};"
                                 then:
-                                  - lambda: 'id(va)->send_interrupt();'
+                                  - lambda: "id(va)->send_interrupt();"
                                   # Fast button-silence after a wake = the
                                   # user shutting up a false trigger; tell
                                   # the backend so it can flag the capture.
-                                  - lambda: 'id(va)->send_button_cancel();'
+                                  - lambda: "id(va)->send_button_cancel();"
                                   - speaker.stop:
                                       id: media_resampling_speaker
                                   - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
@@ -540,7 +539,7 @@ binary_sensor:
                                       then:
                                         - speaker.stop:
                                             id: media_resampling_speaker
-                                        - lambda: 'id(va)->send_button_cancel();'
+                                        - lambda: "id(va)->send_button_cancel();"
                                       else:
                                         - if:
                                             condition:
@@ -565,7 +564,7 @@ binary_sensor:
                                                               id: external_media_player
                                                         timeout: 2s
                                                     - delay: 600ms
-                                                    - lambda: 'id(va)->start_session();'
+                                                    - lambda: "id(va)->start_session();"
                                                     - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
                                                     - script.execute: control_leds
       # Double Click
@@ -590,8 +589,8 @@ binary_sensor:
                 # so there is nothing to keep conversing about (observed live:
                 # a radio-triggered session kept chatting for 17s after the
                 # flag until a separate single-press stopped it).
-                - lambda: 'id(va)->send_false_flag();'
-                - lambda: 'id(va)->send_interrupt();'
+                - lambda: "id(va)->send_false_flag();"
+                - lambda: "id(va)->send_interrupt();"
                 - speaker.stop:
                     id: media_resampling_speaker
                 - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
@@ -1472,12 +1471,12 @@ script:
       - if:
           condition:
             and:
-              - lambda: 'return id(va)->is_connected();'
+              - lambda: "return id(va)->is_connected();"
               - light.is_on: led_ring
           then:
             - light.turn_on:
                 id: voice_assistant_leds
-                brightness: !lambda 'return max(id(led_ring).current_values.get_brightness(), 0.2f);'
+                brightness: !lambda "return max(id(led_ring).current_values.get_brightness(), 0.2f);"
                 effect: "Active Pulse"
           else:
             - light.turn_off: voice_assistant_leds
@@ -1624,7 +1623,7 @@ script:
   - id: control_volume
     mode: restart
     parameters:
-      increase_volume: bool  # True: Increase volume / False: Decrease volume.
+      increase_volume: bool # True: Increase volume / False: Decrease volume.
     then:
       - delay: 16ms
       - if:
@@ -1648,7 +1647,7 @@ script:
   - id: control_group_volume
     mode: restart
     parameters:
-      increase_volume: bool  # True: Increase volume / False: Decrease volume.
+      increase_volume: bool # True: Increase volume / False: Decrease volume.
     then:
       - delay: 16ms
       # TODO va-direct: no sendspin_group_media_player; group volume not supported.
@@ -1666,7 +1665,7 @@ script:
   - id: control_hue
     mode: restart
     parameters:
-      increase_hue: bool  # True: Increase hue / False: Decrease hue.
+      increase_hue: bool # True: Increase hue / False: Decrease hue.
     then:
       - delay: 16ms
       - if:
@@ -1785,7 +1784,7 @@ script:
 
   - id: check_if_timers_active
     then:
-      - lambda: 'id(is_timer_active) = false;  // TODO va-direct: no timer API on va_client yet'
+      - lambda: "id(is_timer_active) = false;  // TODO va-direct: no timer API on va_client yet"
 
   # DEAD CODE (va-direct): in the original yaml this script enabled the
   # stop wake word while external_media_player was announcing. We no
@@ -1930,9 +1929,9 @@ media_player:
       - lambda: |-
           id(va).set_volume(id(external_media_player).is_muted() ? 0.0f : 1.0f);
     on_mute:
-      - lambda: 'id(va).set_volume(0.0f);'
+      - lambda: "id(va).set_volume(0.0f);"
     on_unmute:
-      - lambda: 'id(va).set_volume(1.0f);'
+      - lambda: "id(va).set_volume(1.0f);"
 
 sendspin:
   id: sendspin_hub
@@ -1983,8 +1982,7 @@ media_source:
     buffer_size: 500000
   - platform: sendspin
     id: sendspin_media_source
-    fixed_delay: 480 microseconds  # The AIC3204 DAC used, as configured, on the VPE delays audio by 480 microseconds
-
+    fixed_delay: 480 microseconds # The AIC3204 DAC used, as configured, on the VPE delays audio by 480 microseconds
 
 voice_kit:
   id: voice_kit_component
@@ -2004,17 +2002,14 @@ external_components:
     components:
       - voice_kit
     refresh: 0s
-  # va_client (the OpenAI-realtime thin client) lives in THIS repo. It is pulled
-  # from GitHub (public, no token) so the config builds without a local checkout.
-  # ref selects the channel (main = stable, dev = WIP); refresh: 0s = always
-  # fetch the latest C++ for that ref. To iterate on the C++ locally instead,
-  # swap this for:
-  #   - source: {type: local, path: esphome/components}
+  # Build the modified va_client from the published True Family firmware
+  # repository.
   - source:
       type: git
-      url: https://github.com/TristanBrotherton/voicepe-realtime-firmware
+      url: https://github.com/TheOnlyHyland/True-Family-Voice-Firmware
       ref: main
-    components: [va_client]
+    components:
+      - va_client
     refresh: 0s
 
 # va-direct: forward device logs to a UDP sink container on the Pi so they
@@ -2116,7 +2111,7 @@ va_client:
           # reject the common reply-echo false stops (sliding-avg 0.41-0.49)
           # while keeping real reply-stops (0.52-0.67). Dropped to 0.40 in the
           # quiet follow-up/idle window below. (See the stop model comment.)
-          - lambda: 'id(stop).set_probability_cutoff(128);'
+          - lambda: "id(stop).set_probability_cutoff(128);"
           - script.stop: followup_window_watchdog
     # A turn is in flight ("listening" = the server VAD heard the user speak,
     # OR the follow-up window just opened its listening LED): stop the disarm
@@ -2142,7 +2137,7 @@ va_client:
           - micro_wake_word.enable_model: stop
           # B3: quiet at rest (no TTS) → restore the sensitive 0.40 (102) so weak
           # real stops in the follow-up window are caught.
-          - lambda: 'id(stop).set_probability_cutoff(102);'
+          - lambda: "id(stop).set_probability_cutoff(102);"
           - script.execute: followup_window_watchdog
   on_repeated_failure:
     # Backend unreachable for N reconnect attempts. SILENT by design (was a
@@ -2181,7 +2176,7 @@ va_client:
           # mid-response. 800 ms lets the echo decay before the mic opens.
           # (Adopted from upstream maxmaxme 38be9c8, same reasoning verified.)
           - delay: 800ms
-    - lambda: 'id(va)->commit_followup_mic();'
+    - lambda: "id(va)->commit_followup_mic();"
     - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
     - script.execute: control_leds
     # Arm the "stop" wake word so the user can abort if they changed
@@ -2191,7 +2186,7 @@ va_client:
     - micro_wake_word.enable_model: stop
     # B3: the follow-up window is quiet (the question's TTS + chime finished
     # before the mic opens) → sensitive 0.40 (102) to catch weak stops.
-    - lambda: 'id(stop).set_probability_cutoff(102);'
+    - lambda: "id(stop).set_probability_cutoff(102);"
     # If the user stays silent, va_client closes the mic at kRequestFollowUpMs
     # but doesn't notify yaml — without this watchdog the LED would stay
     # in listening_for_command forever and `stop` would never disarm.
@@ -2221,7 +2216,7 @@ micro_wake_word:
     # so the sensitivity select keeps working. To use a stock wake word instead:
     # https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json
     - model: ${wake_word_model}
-      id: alexa   # primary (historical id kept — scripts reference it)
+      id: alexa # primary (historical id kept — scripts reference it)
     - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json
       id: wake_jarvis
     - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/okay_nabu.json
@@ -2270,7 +2265,7 @@ micro_wake_word:
     # "fired but swallowed by the mute switch". Remove once wake word is confirmed.
     - logger.log:
         format: "WAKE fired: '%s' (muted=%d)"
-        args: ['wake_word.c_str()', 'id(master_mute_switch).state']
+        args: ["wake_word.c_str()", "id(master_mute_switch).state"]
         level: WARN
     # If the wake word is detected when the device is muted (Possible with the software mute switch): Do nothing
     - if:
@@ -2312,9 +2307,9 @@ micro_wake_word:
                       # follow-up window, so a real barge-in there still works.)
                       - if:
                           condition:
-                            lambda: 'return id(voice_assistant_phase) != ${voice_assist_idle_phase_id} && id(va)->turn_has_reply_audio();'
+                            lambda: "return id(voice_assistant_phase) != ${voice_assist_idle_phase_id} && id(va)->turn_has_reply_audio();"
                           then:
-                            - lambda: 'id(va)->send_interrupt();'
+                            - lambda: "id(va)->send_interrupt();"
                             - speaker.stop:
                                 id: media_resampling_speaker
                             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
@@ -2326,7 +2321,7 @@ micro_wake_word:
                           else:
                             - logger.log:
                                 format: "ignoring 'stop' — no reply audio yet (phase=%d), nothing to stop"
-                                args: ['id(voice_assistant_phase)']
+                                args: ["id(voice_assistant_phase)"]
                                 level: INFO
                     else:
                       # Non-stop wake word: branch on the assistant's current
@@ -2334,11 +2329,11 @@ micro_wake_word:
                       # the reply); idle/listening/thinking → fresh session.
                       - if:
                           condition:
-                            lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
+                            lambda: "return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};"
                           then:
                             # Interrupt the active reply. Flush the queue +
                             # stop the resampler so audio cuts immediately.
-                            - lambda: 'id(va)->send_interrupt();'
+                            - lambda: "id(va)->send_interrupt();"
                             - speaker.stop:
                                 id: media_resampling_speaker
                             # Play the same wake chime as fresh-session so the
@@ -2376,7 +2371,7 @@ micro_wake_word:
                             # the mic open after a Stop), so we drive it
                             # explicitly here. start_session() is idempotent
                             # against the send_interrupt() above.
-                            - lambda: 'id(va)->start_session();'
+                            - lambda: "id(va)->start_session();"
                             - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
                             - script.execute: control_leds
                           else:
@@ -2390,7 +2385,7 @@ micro_wake_word:
                             # so the failure mode is audible.
                             - if:
                                 condition:
-                                  lambda: 'return !id(va)->is_connected();'
+                                  lambda: "return !id(va)->is_connected();"
                                 then:
                                   - script.execute:
                                       id: play_sound
@@ -2434,7 +2429,7 @@ micro_wake_word:
                                         # 400 ms, which let the chime tail leak into
                                         # the fresh mic as a ghost turn (2026-06-12).
                                         - delay: !lambda "return id(va)->get_wake_open_delay_ms();"
-                                  - lambda: 'id(va)->start_session();'
+                                  - lambda: "id(va)->start_session();"
                                   # Show "waiting for command" (blue spin) immediately on wake,
                                   # before the server VAD detects actual speech. va_client's
                                   # on_phase will overwrite to phase 3 (listening_for_command)
@@ -2483,7 +2478,6 @@ select:
         } else if (x == "Very sensitive") {
           id(alexa).set_probability_cutoff(${wake_cutoff_very});
         }
-
 
 button:
   - platform: factory_reset
