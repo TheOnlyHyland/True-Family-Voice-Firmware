@@ -82,8 +82,8 @@ esphome:
   # Project identity drives the ESPHome dashboard "Update available" badge: bump
   # `version` on a release (merge to main) and adopted devices are offered it.
   project:
-    name: "tristanbrotherton.voice-pe-openai-realtime"
-    version: "1.2.0"
+    name: "true_tech_solutions.true_family_voice"
+    version: "0.17.0"
   min_version: 2026.5.0
   on_boot:
     priority: 375
