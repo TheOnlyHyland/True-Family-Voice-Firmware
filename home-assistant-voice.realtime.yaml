@@ -2032,9 +2032,10 @@ va_client:
   url: ${va_url}
   microphone: i2s_mics
   mic_channel: 0
-  # Handsfree barge-in keeps the AEC microphone stream open while the assistant
-  # speaks so Realtime server VAD can cancel the reply when the user talks.
-  barge_in: true
+  # Automatic handsfree barge-in is disabled because the Voice PE's speaker
+  # leakage triggers false server-VAD interruptions. Local "Stop", the center
+  # button, and post-reply follow-up listening remain available.
+  barge_in: false
   # Write raw PCM16 mono 24kHz into the media resampler. We can't share the
   # announcement lane with external_media_player — va_client grabs the
   # resampling speaker on setup and holds it, which prevents the upstream
