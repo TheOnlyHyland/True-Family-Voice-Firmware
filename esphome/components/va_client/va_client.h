@@ -294,13 +294,17 @@ class VaClient : public Component {
   uint32_t playback_prebuffer_ms_{0};
   static constexpr uint32_t kPlaybackPrebufferMaxMs = 2000;
   static constexpr uint32_t kPlaybackSampleRate = 24000;  // incoming TTS PCM rate
+  // The WS task publishes an empty→nonempty transition here. loop() resolves
+  // whether the downstream chain is dry because speaker state is main-task-only.
+  bool playback_prebuffer_pending_{false};
   // True while we're accumulating the prebuffer cushion (holding playback).
-  // Touched by handle_binary_ (WS task, arms it) + loop() (main task, releases);
-  // plain flag like streaming_, the tiny race is harmless.
+  // Main-task decisions and WS-task resets are protected by ring_mux_.
   bool playback_priming_{false};
   // millis() when priming started (first byte after the ring was empty); used
   // for the prime deadline so real-time (non-burst) audio still starts promptly.
   uint32_t prime_started_ms_{0};
+  // Rejects stale main-loop decisions after an interrupt and a new reply start.
+  uint32_t prebuffer_generation_{0};
 
   // Resampler cold-start SILENCE-PRIME (crackle fix). The resampler does NOT
   // idle-timeout (verified vs ESPHome source): resample(stop_gracefully=false)

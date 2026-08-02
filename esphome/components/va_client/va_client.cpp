@@ -104,8 +104,55 @@ void VaClient::loop() {
     size_t head = this->audio_head_;
     size_t tail = this->audio_tail_;
     size_t fill = this->audio_fill_;
+    const bool playback_prebuffer_pending = this->playback_prebuffer_pending_;
+    const bool playback_priming = this->playback_priming_;
+    const uint32_t prime_started_ms = this->prime_started_ms_;
+    const uint32_t playback_prebuffer_ms = this->playback_prebuffer_ms_;
+    const uint32_t prebuffer_generation = this->prebuffer_generation_;
     portEXIT_CRITICAL(&this->ring_mux_);
     if (fill > 0) {
+      // Decide whether this empty→nonempty transition needs a jitter cushion
+      // from the main task. Resampler state is not safe to inspect from the WS
+      // task, so that task publishes only this pending decision with the ring.
+      if (playback_prebuffer_pending) {
+        const bool should_prime = !this->speaker_->has_buffered_data();
+        portENTER_CRITICAL(&this->ring_mux_);
+        if (this->playback_prebuffer_pending_ &&
+            this->prebuffer_generation_ == prebuffer_generation) {
+          this->playback_prebuffer_pending_ = false;
+          this->playback_priming_ = should_prime;
+          if (!should_prime)
+            this->prime_started_ms_ = 0;
+        }
+        portEXIT_CRITICAL(&this->ring_mux_);
+        return;  // Re-snapshot the resolved state before touching the ring.
+      }
+
+      // Accumulate the jitter cushion before warming the downstream chain. If
+      // we prime first, a large prebuffer can outlast kChainColdMs and let the
+      // resampler stop again before the first real sample reaches it.
+      if (playback_priming) {
+        bool release_succeeded = false;
+        const size_t target =
+            (size_t) playback_prebuffer_ms * (kPlaybackSampleRate / 1000) * 2;
+        if (fill >= target ||
+            (millis() - prime_started_ms) >= playback_prebuffer_ms) {
+          portENTER_CRITICAL(&this->ring_mux_);
+          if (this->playback_priming_ &&
+              this->prebuffer_generation_ == prebuffer_generation) {
+            this->playback_priming_ = false;
+            release_succeeded = true;
+          }
+          portEXIT_CRITICAL(&this->ring_mux_);
+          if (!release_succeeded)
+            return;  // Interrupted or re-armed while this snapshot was in flight.
+          ESP_LOGD(TAG, "prebuffer ready (%u bytes) — checking chain before playback",
+                   (unsigned) fill);
+        } else {
+          return;  // Keep accumulating; do not warm the chain prematurely.
+        }
+      }
+
       // Resampler cold-start SILENCE-PRIME (crackle fix). The resampler does NOT
       // idle-timeout (verified vs ESPHome source): resample(stop_gracefully=false)
       // never returns FINISHED, and its output mixer-source is timeout:never, so the
@@ -145,23 +192,6 @@ void VaClient::loop() {
           // Hold real-audio drain until the chain is warmed. Real audio stays in
           // PSRAM. Re-enter loop() next tick to continue/finish priming.
           return;
-        }
-      }
-      // Jitter buffer priming gate. After the ring was empty (reply start or a
-      // post-underflow gap) hold playback until either the prebuffer cushion has
-      // accumulated (fill >= target) or a deadline elapses (so real-time, non-
-      // burst audio still starts promptly). Holding here lets the downstream
-      // chain start with a cushion so a network gap doesn't dry it out → no
-      // crackle. Skipped entirely when playback_prebuffer_ms_ == 0 (disabled).
-      if (this->playback_priming_) {
-        const size_t target =
-            (size_t) this->playback_prebuffer_ms_ * (kPlaybackSampleRate / 1000) * 2;
-        if (fill >= target ||
-            (millis() - this->prime_started_ms_) >= this->playback_prebuffer_ms_) {
-          this->playback_priming_ = false;
-          ESP_LOGD(TAG, "prebuffer ready (%u bytes) — playback start", (unsigned) fill);
-        } else {
-          return;  // keep accumulating; don't drain (and don't false-flag underrun)
         }
       }
       // Detector 3: downstream underrun. If the resampler/mixer/i2s chain
@@ -491,7 +521,14 @@ void VaClient::handle_text_(const char *data, size_t len) {
     if (parse_uint_after_key(msg, "\"playback_prebuffer_ms\":", v)) {
       if (v > kPlaybackPrebufferMaxMs)
         v = kPlaybackPrebufferMaxMs;
+      portENTER_CRITICAL(&this->ring_mux_);
       this->playback_prebuffer_ms_ = v;
+      if (v == 0) {
+        this->playback_prebuffer_pending_ = false;
+        this->playback_priming_ = false;
+        this->prime_started_ms_ = 0;
+      }
+      portEXIT_CRITICAL(&this->ring_mux_);
       ESP_LOGI(TAG, "hello: playback prebuffer (jitter buffer) = %u ms (%s)", (unsigned) v,
                v == 0 ? "disabled" : "cushion before playback");
     }
@@ -692,19 +729,18 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   }
   this->audio_tail_ = (tail + len) % kAudioBufBytes;
   this->audio_fill_ += len;
-  portEXIT_CRITICAL(&this->ring_mux_);
-  // Jitter buffer: arm priming only when the ring was empty AND the downstream
-  // chain is dry — i.e. a true reply start or a real underflow. Mid-reply the
-  // ring routinely flips empty (loop() drains each WS clump on arrival) while
-  // the downstream chain still holds ~600 ms of audio; re-arming there did
-  // nothing but spam "prebuffer ready" every ~50 ms and could hold a small
-  // trailing chunk for the full prebuffer deadline. has_buffered_data() is a
-  // counter read, safe enough from the WS task. Only when enabled.
-  if (was_empty && this->playback_prebuffer_ms_ > 0 && !this->playback_priming_ &&
-      !this->speaker_->has_buffered_data()) {
+  // Publish the empty→nonempty transition and its pending jitter decision
+  // atomically. The main loop resolves downstream state from its own task.
+  if (was_empty && this->playback_prebuffer_ms_ > 0 &&
+      !this->playback_prebuffer_pending_ && !this->playback_priming_) {
     this->prime_started_ms_ = now_ms;
-    this->playback_priming_ = true;
+    this->prebuffer_generation_++;
+    this->playback_prebuffer_pending_ = true;
   }
+  portEXIT_CRITICAL(&this->ring_mux_);
+  // The main loop arms priming only if the downstream chain is also dry. This
+  // avoids holding routine mid-reply clumps while keeping speaker access on its
+  // owning task.
   // No per-chunk log — fires 50+ times per reply at DEBUG and drowns the
   // log. The throttled drain log in loop() gives enough visibility into
   // queue depth.
@@ -885,6 +921,9 @@ void VaClient::set_phase_(const std::string &phase) {
       this->audio_head_ = 0;
       this->audio_tail_ = 0;
       this->audio_fill_ = 0;
+      this->playback_prebuffer_pending_ = false;
+      this->playback_priming_ = false;
+      this->prime_started_ms_ = 0;
       portEXIT_CRITICAL(&this->ring_mux_);
       this->idle_emit_pending_ = false;
       ESP_LOGI(TAG, "phase=listening during reply — barge-in, flushed TTS queue");
@@ -1419,12 +1458,13 @@ void VaClient::send_interrupt() {
   this->audio_head_ = 0;
   this->audio_tail_ = 0;
   this->audio_fill_ = 0;
+  this->playback_prebuffer_pending_ = false;
+  this->playback_priming_ = false;
+  this->prime_started_ms_ = 0;
   portEXIT_CRITICAL(&this->ring_mux_);
   // Drop further incoming TTS until the backend confirms the turn boundary —
   // it keeps streaming the rest of the (already-generated) reply otherwise.
   this->suppress_incoming_audio_ = true;
-  // Ring was just flushed; re-arm the jitter buffer fresh for the next reply.
-  this->playback_priming_ = false;
   // Abandon any in-progress cold-start silence-prime; the next reply will detect
   // cold and re-prime cleanly.
   this->chain_prime_remaining_ = 0;
