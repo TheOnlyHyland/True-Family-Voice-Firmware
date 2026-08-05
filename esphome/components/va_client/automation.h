@@ -20,11 +20,9 @@ class OnRepeatedFailureTrigger : public Trigger<> {
   }
 };
 
-// Fires when the device opens a follow-up mic window (i.e. server's
-// request_follow_up message landed and the audio buffer has drained).
-// yaml uses this to play the wake chime + flip the LED to "listening"
-// so the user knows the assistant is waiting for their answer.
-class OnFollowupOpenedTrigger : public Trigger<> {
+// Fires after reply drainage but before the mic opens. YAML receives the bound
+// token and session nonce, plays the chime, and returns both on commit.
+class OnFollowupOpenedTrigger : public Trigger<uint32_t, uint32_t> {
  public:
   explicit OnFollowupOpenedTrigger(VaClient *parent) {
     parent->add_on_followup_opened_trigger(this);

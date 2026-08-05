@@ -3,6 +3,7 @@
 #include "esphome/core/component.h"
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/speaker/speaker.h"
+#include "follow_up_lifecycle.h"
 
 #include <atomic>
 #include <cstdint>
@@ -25,14 +26,10 @@ class VaClient : public Component {
   void set_microphone(microphone::Microphone *m) { mic_ = m; }
   void set_mic_channel(uint8_t c) { mic_channel_ = c; }
   void set_speaker(speaker::Speaker *s) { speaker_ = s; }
-  // Enables handsfree barge-in: when true the mic keeps streaming through the
-  // `thinking`/`replying` phases instead of being gated off, so the backend's
-  // server VAD can hear the user talk over the assistant. On the `listening`
-  // transition that follows (server confirmed a barge-in) we flush the PSRAM
-  // playback queue so the old TTS stops immediately. When false the firmware
-  // keeps the original turn-based behaviour (mic off while the assistant
-  // speaks). Relies on the XMOS AEC to suppress speaker→mic echo; see the
-  // ~10x leak caveat in CLAUDE.md.
+  void set_announcement_speaker(speaker::Speaker *s) { announcement_speaker_ = s; }
+  // Legacy backend 0.20.6 may keep its historical handsfree barge-in behavior.
+  // Trusted sessions always use strict single-turn endpointing and close input
+  // at phase=thinking regardless of this setting.
   void set_barge_in(bool v) { barge_in_ = v; }
   // Sets the output-volume multiplier applied to TTS in handle_binary_.
   // Driven from yaml by external_media_player's volume / mute state so the
@@ -56,14 +53,21 @@ class VaClient : public Component {
   // become a ghost turn. Pushed from the backend `hello` (wake_open_delay_ms);
   // the wake automation reads it via `- delay: !lambda`. Defaults to the safe
   // kWakeOpenDelayMs so an old backend (no key) still behaves sensibly.
-  uint32_t get_wake_open_delay_ms() const { return wake_open_delay_ms_; }
+  uint32_t get_wake_open_delay_ms() const { return wake_open_delay_ms_.load(); }
+  uint32_t get_followup_open_delay_ms() const {
+    return followup_open_delay_ms_.load();
+  }
 
   void setup() override;
   void loop() override;
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
   // YAML-callable actions.
-  void start_session();
+  uint32_t prepare_local_wake();
+  bool pending_wake_is_safe(uint32_t wake_reservation);
+  bool start_session(uint32_t wake_reservation);
+  void abort_local_wake(uint32_t wake_reservation);
+  bool explicit_followup_active();
   // Enrollment mode (fork): mic pinned open streaming to the backend, session
   // timers suspended, backend phases ignored. Entered/exited via the backend's
   // {"type":"enroll","mode":...} control message or device-side (button/cap).
@@ -76,12 +80,15 @@ class VaClient : public Component {
   void send_false_flag();
   bool enroll_active() const { return this->enroll_mode_; }
   void send_interrupt();
-  // Called from yaml's on_followup_opened automation AFTER the chime has
-  // finished announcing through the speaker (wait_until !is_announcing +
-  // i2s tail). Opens the mic for kRequestFollowUpMs. No-op if the device
-  // is no longer armed (e.g. user already pressed wake before the chime
-  // finished — the new session takes priority).
-  void commit_followup_mic();
+  // The credentials bind a delayed YAML chime callback to the request and wake
+  // generation that created it. A stale callback cannot open a newer session.
+  bool mark_followup_ready(uint32_t token, uint32_t session_nonce);
+  void abort_followup_mic(uint32_t token, uint32_t session_nonce);
+  // Mute revokes the no-wake path without stopping reply playback.
+  void revoke_followup();
+  void revoke_for_mute();
+  void release_mute();
+  void set_announcement_active(bool active);
   // True once this turn has produced audible reply audio (the first
   // non-suppressed binary chunk set turn_t_first_audio_out_; reset to 0 on
   // every start_session()). The yaml "stop" handler uses this to ignore a
@@ -89,12 +96,15 @@ class VaClient : public Component {
   // there is nothing to stop yet, and a false "stop" on the user's own speech
   // would otherwise corrupt the turn (no follow-up window). Reply/follow-up/
   // request-follow-up windows all have it set, so a real barge-in still works.
-  bool turn_has_reply_audio() const { return this->turn_t_first_audio_out_ != 0; }
+  bool turn_has_reply_audio() const { return this->turn_t_first_audio_out_.load() != 0; }
 
   // Called from the static esp-idf event handler trampoline.
   void on_ws_event(int32_t event_id, void *event_data);
 
  protected:
+  struct ControlContext;
+  enum class Phase : uint8_t { IDLE = 0, LISTENING, THINKING, REPLYING, ENROLLING };
+
   void connect_();
   void schedule_reconnect_();
   void on_mic_data_(const std::vector<uint8_t> &samples);
@@ -104,13 +114,27 @@ class VaClient : public Component {
   // later wake and answered as a stale half-sentence. Clearing at the cut-off
   // source means no reactive clear-on-wake is needed (that one disturbed the
   // server VAD and caused spurious garbage commits). No-op if nothing buffered.
-  void send_mic_flush_();
+  bool send_mic_flush_(uint32_t session_nonce, uint32_t wake_generation);
   // Tell the backend a fresh wake started ({"type":"wake"}), for the
   // dangling-VAD guard: a server-VAD end-of-turn before the user speaks is a
   // stale pre-wake segment → backend suppresses its thinking + cancels its
   // garbage response. Sent on every start_session(); old backends ignore it.
-  void send_wake_();
+  bool send_wake_(uint32_t session_nonce, uint32_t wake_generation);
+  bool send_text_bounded_(const std::string &message, const char *label);
+  bool send_binary_bounded_(const uint8_t *data, size_t len);
+  bool send_client_revoke_(const char *reason, uint32_t session_nonce,
+                           uint32_t wake_generation);
+  bool send_interrupt_control_(const char *reason, uint32_t session_nonce,
+                               uint32_t wake_generation);
+  bool send_hello_ack_(uint32_t nonce, bool accepted);
+  bool send_request_follow_up_ack_(uint32_t token, uint32_t session_nonce, bool accepted);
+  bool send_cancel_request_follow_up_ack_(uint32_t token, uint32_t session_nonce,
+                                          bool accepted, bool cleared);
+  bool send_follow_up_ready_(const FollowUpCredentials &credentials);
+  bool send_follow_up_commit_ack_(uint32_t token, uint32_t session_nonce,
+                                  uint32_t ready_nonce, bool accepted);
   void send_graceful_close_ack_(const char *stage, uint32_t token, bool accepted);
+  void clear_request_follow_up_(bool close_window);
   // Mic pre-roll helper (mic-task only, no lock). push appends to the rolling
   // ring while the session is closed; the ring is DISCARDED (not replayed) on
   // session open — see preroll_discard_pending_.
@@ -118,21 +142,57 @@ class VaClient : public Component {
   void handle_text_(const char *data, size_t len);
   void handle_binary_(const uint8_t *data, size_t len);
   void set_phase_(const std::string &phase);
+  void apply_phase_side_effects_(const std::string &phase, Phase runtime_phase,
+                                  Phase runtime_previous,
+                                  const PhaseApplyResult &transition);
+  bool phase_effect_plan_current_(const PhaseApplyResult &transition);
   // Marshal a phase-LED trigger fire onto the main loop (used to drive the LED
   // ring to `listening`/`idle` from timer callbacks during the follow-up window,
   // independently of a server-sent phase).
   void fire_phase_led_(const std::string &phase);
   void open_followup_window_(uint32_t duration_ms);
+  void cancel_session_timers_();
+  bool revoke_followup_(const char *reason, bool notify_backend,
+                        bool post_stop = false,
+                        ControlContext *closed_context = nullptr);
+  void close_audio_ring_();
+  size_t audio_fill_snapshot_();
+  uint32_t generate_ready_nonce_();
+  bool microphone_is_muted_();
+  bool announcement_path_clear_();
+  bool wait_for_mic_send_barrier_(const char *failure_reason);
+  void quarantine_transport_(const char *reason);
+
+  struct ControlContext {
+    uint32_t session_nonce{0};
+    uint32_t wake_generation{0};
+    uint32_t effect_epoch{0};
+  };
+  ControlContext control_context_();
+  bool legacy_zero_mode_();
 
   std::string url_;
   uint8_t mic_channel_{0};
 
   microphone::Microphone *mic_{nullptr};
   speaker::Speaker *speaker_{nullptr};
+  speaker::Speaker *announcement_speaker_{nullptr};
+  std::atomic_bool announcement_active_{false};
+  MicSendFence mic_send_fence_;
+  GenerationEffectGate generation_effect_gate_;
+  TransportAdmissionGate transport_admission_;
 
   // esp_websocket_client_handle_t kept opaque to avoid leaking esp-idf into the header.
   void *ws_handle_{nullptr};
-  bool ws_connected_{false};
+  std::atomic_bool ws_connected_{false};
+  // Hardware mute is surfaced through the YAML master switch and is not
+  // necessarily reflected by Microphone::get_mute_state(). Keep it latched
+  // until that combined switch explicitly reports unmuted.
+  std::atomic_bool external_mute_{false};
+  std::atomic_uint32_t ws_connection_generation_{0};
+  // Nonzero only after a nonce-bearing hello was fully validated and applied.
+  // Legacy nonce-less hello remains supported but is never a trusted session.
+  std::atomic_uint32_t session_nonce_{0};
 
   uint32_t reconnect_delay_ms_{1000};
   // Set when a reconnect timer is in flight. esp_websocket_client emits both
@@ -145,8 +205,8 @@ class VaClient : public Component {
   // reply check — as a std::string that was a cross-task data race (benign in
   // practice thanks to SSO, but UB). The yaml trigger path still receives the
   // phase as a string parameter; only this cross-task state is an enum.
-  enum class Phase : uint8_t { IDLE = 0, LISTENING, THINKING, REPLYING, ENROLLING };
   static Phase phase_from_string_(const std::string &phase);
+  static PilotPhase pilot_phase_from_runtime_(Phase phase);
   static const char *phase_name_(Phase p);
   std::atomic<uint8_t> current_phase_{static_cast<uint8_t>(Phase::IDLE)};
   std::vector<OnPhaseTrigger *> phase_triggers_;
@@ -186,23 +246,23 @@ class VaClient : public Component {
   // gemini_proxy's ring_buffer_->reset() on start. Trade-off: a word spoken
   // *during* the chime is lost; the user speaks once the listening ring lights.
   // Touched ONLY by the mic task (on_mic_data_) — no lock needed.
-  // preroll_discard_pending_ is set by start_session()/commit_followup_mic()
-  // (main loop) and consumed by the mic task: a plain bool like streaming_.
+  // preroll_discard_pending_ is set by start_session() or final follow-up COMMIT
+  // (main loop) and consumed by the mic task through an atomic handoff.
   static constexpr uint32_t kMicSampleRate = 16000;  // i2s_mics rate (16 samples/ms)
   static constexpr uint32_t kPreRollMs = 600;
   int16_t *preroll_buf_{nullptr};
   size_t preroll_capacity_samples_{0};
   size_t preroll_head_{0};   // next write index
   size_t preroll_count_{0};  // valid samples (<= capacity)
-  bool preroll_discard_pending_{false};
+  std::atomic_bool preroll_discard_pending_{false};
 
   // Streaming gate. True while the mic should be forwarded to the server:
-  //   - between wake-word start_session() and "listening"/"thinking"
-  //   - and again after "idle" for kFollowupMs (in case AI asked a question)
-  bool streaming_{false};
+  //   - between wake-word start_session() and trusted phase=thinking
+  //   - and after a nonce-bound explicit follow-up COMMIT
+  std::atomic_bool streaming_{false};
   // Enrollment mode: while true, streaming_ stays on, backend phases are
   // ignored, and a hard cap timer guards against a forgotten session.
-  bool enroll_mode_{false};
+  std::atomic_bool enroll_mode_{false};
   uint32_t enroll_started_ms_{0};
   static constexpr uint32_t kEnrollMaxMs = 10 * 60 * 1000;
   // Handsfree barge-in toggle, set from yaml (`barge_in:`). See set_barge_in().
@@ -210,28 +270,39 @@ class VaClient : public Component {
   // Set on phase=idle when there's still TTS audio queued — we can't open
   // the mic until the speaker drains, otherwise it picks up its own output.
   // loop() flips this to a live followup window once audio_fill_ hits 0.
-  bool followup_pending_{false};
+  std::atomic_bool followup_pending_{false};
   // Tracks whether the pending follow-up was requested by the server's
   // request_follow_up tool (model asked a question) vs the natural
   // post-reply path. The former wants a longer mic window
-  // (kRequestFollowUpMs); the latter uses kFollowupMs (which is 0 by
-  // default — no auto-follow-up).
-  bool request_follow_up_pending_{false};
+  // (kRequestFollowUpMs); legacy automatic follow-up is hard-disabled.
+  std::atomic_bool request_follow_up_pending_{false};
+  // One bounded backend-issued transaction token owns the complete explicit
+  // follow-up lifecycle: pending reply drain, yaml chime, and open mic window.
+  std::atomic_uint32_t request_follow_up_token_{0};
+  // The callback itself carries token and nonce. These fields ensure only the
+  // currently in-flight callback can commit or abort its aperture.
+  std::atomic_bool request_follow_up_callback_in_flight_{false};
+  std::atomic_uint32_t request_follow_up_callback_token_{0};
+  std::atomic_uint32_t request_follow_up_callback_session_nonce_{0};
+  // Serializes the compound token/armed/window/streaming transition shared by
+  // the websocket cancellation path and the main-loop YAML callback.
+  portMUX_TYPE followup_mux_ = portMUX_INITIALIZER_UNLOCKED;
+  FollowUpLifecycle lifecycle_;
   // Set when on_followup_opened has fired and we're waiting on yaml to
-  // play the chime + call commit_followup_mic(). Cleared on commit or
+  // play the chime + call the credential-bound commit. Cleared on commit or
   // when a new session preempts. Without this flag a stale
-  // commit_followup_mic() call (e.g. delayed lambda after a `Stop` wake
+  // callback (e.g. a delayed lambda after a `Stop` wake
   // word already reset state) would re-open the mic out of nowhere.
-  bool followup_armed_{false};
+  std::atomic_bool followup_armed_{false};
   // Server sends phase=idle when OpenAI is done generating, but we still
   // have audio queued in PSRAM + downstream rings. If we fire the LED
   // trigger immediately the device looks idle while still speaking. Hold
   // the "idle" emission until the queue drains + kFollowupOpenDelayMs.
-  bool idle_emit_pending_{false};
+  std::atomic_bool idle_emit_pending_{false};
   // Set by send_interrupt() so the phase=idle that follows from the server
   // doesn't trigger a follow-up mic window. The user explicitly asked us to
   // stop — they don't want the device sitting there listening.
-  bool suppress_followup_{false};
+  std::atomic_bool suppress_followup_{false};
   // Two-phase, token-bound model close, separate from hard Stop. Prepare never
   // closes anything; a matching commit during the same active turn arms the
   // token that loop() consumes after the final reply drains.
@@ -244,7 +315,7 @@ class VaClient : public Component {
   // from the in-flight frames. While this is true we DROP incoming audio so the
   // cancelled reply actually goes silent. Cleared in set_phase_ on the next
   // "idle" (reply ended) or "listening" (a fresh turn's audio is legitimate).
-  bool suppress_incoming_audio_{false};
+  std::atomic_bool suppress_incoming_audio_{false};
   // Set by send_interrupt() (a local "stop"), cleared in start_session() (the
   // next wake). After a stop the mic gate is CLOSED, so no new turn can begin
   // until a wake — yet OpenAI's server VAD can still fire an end-of-turn for
@@ -256,7 +327,7 @@ class VaClient : public Component {
   // preceded by a wake, which clears this). Scoped to `thinking` only: a web
   // search's replying->thinking has no stop so this stays false (don't break
   // the search animation), and a reply-drain emits no `thinking` (mic gated).
-  bool post_stop_guard_{false};
+  std::atomic_bool post_stop_guard_{false};
   // Live duration (ms) of the post-reply follow-up window: how long the mic
   // stays open after the assistant finishes so the user can answer back
   // WITHOUT re-saying the wake word. Pushed from the backend add-on in the
@@ -265,7 +336,7 @@ class VaClient : public Component {
   // reply). Clamped to kFollowupMsMax on parse. The window only opens AFTER the
   // speaker chain drains + kFollowupOpenDelayMs so the assistant's own TTS tail
   // can't leak into the open mic (XMOS AEC ~10x leak).
-  uint32_t followup_ms_{0};
+  std::atomic_uint32_t followup_ms_{0};
   static constexpr uint32_t kFollowupMsMax = 60000;
   // Live delay (ms) between the speaker draining and the follow-up mic opening,
   // also pushed from the backend `hello` ("follow_up_open_delay_ms":N). Covers
@@ -273,8 +344,7 @@ class VaClient : public Component {
   // so the mic doesn't catch the reply's own tail. Defaults to the conservative
   // kFollowupOpenDelayMs but is tunable from the add-on (lower = snappier, risk
   // of hearing the tail; higher = safer). Clamped to kFollowupOpenDelayMaxMs.
-  uint32_t followup_open_delay_ms_{kFollowupOpenDelayMs};
-  static constexpr uint32_t kFollowupOpenDelayMaxMs = 5000;
+  std::atomic_uint32_t followup_open_delay_ms_{kFollowupOpenDelayMs};
   // Wake-chime echo guard: delay (ms) the yaml wake handler waits after the
   // wake chime before opening the mic. The wake-path twin of
   // followup_open_delay_ms_ (the follow-up boundary). Pushed from the backend
@@ -282,7 +352,7 @@ class VaClient : public Component {
   // Default 700 matches the backend default so a device on an old backend (no
   // key in hello) still gets the safe value rather than the old hardcoded 400.
   static constexpr uint32_t kWakeOpenDelayMs = 700;
-  uint32_t wake_open_delay_ms_{kWakeOpenDelayMs};
+  std::atomic_uint32_t wake_open_delay_ms_{kWakeOpenDelayMs};
   // Playback jitter buffer ("prebuffer"). Before starting/resuming playback we
   // hold audio in the PSRAM ring until at least this many ms have accumulated
   // (or a short deadline elapses), so the downstream resampler/mixer/i2s chain
@@ -332,11 +402,6 @@ class VaClient : public Component {
   // from the backend (followup_ms_); this stays 0 so a device talking to an
   // old backend that doesn't send follow_up_ms keeps the turn-based behaviour.
   static constexpr uint32_t kFollowupMs = 0;
-  // Used when the server explicitly requests a follow-up via the
-  // request_follow_up tool — overrides kFollowupMs for a single turn.
-  // Longer than the default because the model asked a real question
-  // and the user might pause before answering.
-  static constexpr uint32_t kRequestFollowUpMs = 10000;
   // After start_session() we wait this long for the server to emit
   // phase=listening (i.e. server VAD heard speech). If nothing comes, the
   // user pressed wake/button and stayed silent — close the session so we
@@ -359,24 +424,26 @@ class VaClient : public Component {
   // margin, but short enough that a wedged speaker doesn't lock the
   // LED in `replying` forever.
   static constexpr uint32_t kSpeakerStopTimeoutMs = 3000;
+  static constexpr uint32_t kControlSendTimeoutMs = 100;
+  static constexpr uint32_t kAudioSendTimeoutMs = 20;
 
   // True while we're waiting for the downstream speaker chain to actually
   // finish playing the TTS we wrote into it. Entered when audio_fill_
   // hits 0 with followup_pending_ set; exited when
   // !speaker_->has_buffered_data() OR kSpeakerStopTimeoutMs elapses.
-  bool waiting_for_speaker_stop_{false};
+  std::atomic_bool waiting_for_speaker_stop_{false};
   // millis() snapshot from when waiting_for_speaker_stop_ went true.
   // Used to fire the fallback timeout if the chain never drains.
   uint32_t speaker_stop_wait_started_ms_{0};
 
-  // Tracks the opcode of the in-flight WS message so we can route
-  // continuation frames (op_code = 0) to the same handler.
-  bool last_data_was_binary_{false};
+  // Bounded per-connection accumulator for ESP-IDF frame chunks and RFC 6455
+  // continuation frames. Reset on every connect/disconnect boundary.
+  WsMessageReassembler ws_reassembler_;
 
   // Output volume multiplier in [0, 1], updated from yaml whenever
   // external_media_player.volume / mute changes. Defaults to 1.0 so a
   // stand-alone va_client (no media_player wiring) still plays audibly.
-  float volume_{1.0f};
+  std::atomic<float> volume_{1.0f};
 
   // Ring buffer for pending TTS audio, allocated in PSRAM. The server can
   // burst the entire response in ~200 ms; we buffer here and drain into
@@ -387,6 +454,8 @@ class VaClient : public Component {
   // PSRAM is 8 MB on the Voice PE so cost is negligible.
   uint8_t *audio_buf_{nullptr};
   static constexpr size_t kAudioBufBytes = 2 * 1024 * 1024;
+  uint8_t *audio_drain_buf_{nullptr};
+  static constexpr size_t kAudioDrainChunkBytes = 4096;
   size_t audio_head_{0};  // read pos (next byte to play)
   size_t audio_tail_{0};  // write pos (next byte to fill)
   size_t audio_fill_{0};  // bytes currently queued (audio_tail_ ≥ audio_head_ when not wrapped)
@@ -408,10 +477,10 @@ class VaClient : public Component {
   // transition; flushed as one summary line when the deferred phase=idle
   // emit fires (i.e. when the speaker has actually drained). Zero means
   // "not yet hit this milestone this turn".
-  uint32_t turn_t_wake_{0};               // start_session() (wake-word handler)
-  uint32_t turn_t_listening_{0};          // server's first phase=listening
-  uint32_t turn_t_thinking_{0};           // server's phase=thinking (end-of-speech)
-  uint32_t turn_t_first_audio_out_{0};    // first binary chunk arrived from server
+  std::atomic_uint32_t turn_t_wake_{0};               // start_session() (wake-word handler)
+  std::atomic_uint32_t turn_t_listening_{0};          // server's first phase=listening
+  std::atomic_uint32_t turn_t_thinking_{0};           // server's phase=thinking (end-of-speech)
+  std::atomic_uint32_t turn_t_first_audio_out_{0};    // first binary chunk arrived from server
 
   // Diagnostics for the "speech sometimes drops into hiss / noise"
   // symptom. We don't know the cause yet, so we measure three things

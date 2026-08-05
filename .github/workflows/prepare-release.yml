@@ -1,0 +1,147 @@
+name: Prepare Firmware Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: "Exact lowercase 40-character commit to build"
+        required: true
+        type: string
+      version:
+        description: "Exact VERSION and future tag"
+        required: true
+        type: string
+      prerelease:
+        description: "Prepare this intent as a prerelease"
+        required: true
+        default: true
+        type: boolean
+      confirm_prepare:
+        description: "Build one immutable release-candidate artifact"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  LANG: "C"
+  LC_ALL: "C"
+  PYTHONHASHSEED: "0"
+  SOURCE_DATE_EPOCH: "1785888000"
+  TZ: "UTC0"
+
+concurrency:
+  group: prepare-firmware-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: ${{ inputs.confirm_prepare }}
+    name: Build One Immutable Release Package
+    runs-on: ubuntu-24.04
+    environment:
+      name: firmware-release
+    steps:
+      - name: Validate explicit release intent
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "TheOnlyHyland/True-Family-Voice-Firmware"
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)(\.(0|[1-9][0-9]*))?)?$ ]]
+      - name: Check out exact candidate commit
+        # actions/checkout v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind source tree, version, and unused tag
+        id: source
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          sh ./scripts/verify-version "$VERSION"
+          grep -Fq "@${VERSION}" home-assistant-voice.realtime.yaml
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            printf 'refusing to prepare an already-tagged version: %s\n' "$VERSION" >&2
+            exit 1
+          fi
+          source_tree=$(git rev-parse 'HEAD^{tree}')
+          [[ "$source_tree" =~ ^[0-9a-f]{40}$ ]]
+          printf 'source_tree=%s\n' "$source_tree" >> "$GITHUB_OUTPUT"
+      - name: Set up pinned Python
+        # actions/setup-python v6.2.0
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13.5"
+          cache: pip
+          cache-dependency-path: |
+            requirements-build.txt
+            requirements-esphome.txt
+      - name: Install locked Python build tools
+        run: >-
+          python -m pip install --disable-pip-version-check --require-hashes
+          --only-binary=:all: --upgrade -r requirements-build.txt
+      - name: Install locked ESPHome dependency closure
+        run: >-
+          python -m pip install --disable-pip-version-check --require-hashes
+          --no-build-isolation -r requirements-esphome.txt
+      - name: Install checksum-locked GNU patch 2.7.6
+        run: |
+          sh ./scripts/install-gnu-patch "$RUNNER_TEMP/gnu-patch-2.7.6"
+          printf '%s\n' "$RUNNER_TEMP/gnu-patch-2.7.6/bin" >> "$GITHUB_PATH"
+      - name: Apply checksum-bound ESPHome build timestamp patch
+        run: sh ./scripts/apply-esphome-source-date-epoch-patch python
+      - name: Test inputs and compile exact generic Realtime source once
+        run: ./scripts/verify --compile
+      - name: Package exact compiled bytes without rebuilding
+        run: sh ./scripts/package-release "${{ inputs.version }}"
+      - name: Bind package to exact source and tag intent
+        env:
+          PRERELEASE: ${{ inputs.prerelease }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 ./scripts/make-release-intent.py \
+            "$VERSION" "$SOURCE_COMMIT" "$SOURCE_TREE" "$PRERELEASE" \
+            "output/$VERSION" prepared-release
+          python3 ./scripts/verify-release-intent.py \
+            "$VERSION" "$SOURCE_COMMIT" "$SOURCE_TREE" "$PRERELEASE" \
+            prepared-release
+      - name: Upload one immutable release package
+        id: artifact
+        # actions/upload-artifact v4.6.0
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: firmware-release-package
+          path: prepared-release
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+      - name: Report exact publication inputs
+        env:
+          ARTIFACT_DIGEST: ${{ steps.artifact.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.artifact.outputs.artifact-id }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          {
+            printf '## Immutable firmware release package prepared\n\n'
+            printf -- '- Version: `%s`\n' "$VERSION"
+            printf -- '- Source commit: `%s`\n' "$SOURCE_COMMIT"
+            printf -- '- Preparation run: `%s`\n' "$GITHUB_RUN_ID"
+            printf -- '- Artifact ID: `%s`\n' "$ARTIFACT_ID"
+            printf -- '- Artifact SHA-256: `%s`\n' "$ARTIFACT_DIGEST"
+          } >> "$GITHUB_STEP_SUMMARY"

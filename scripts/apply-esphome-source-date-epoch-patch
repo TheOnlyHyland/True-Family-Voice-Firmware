@@ -1,0 +1,70 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PYTHON=${1:-python3}
+PATCH_FILE="$ROOT/scripts/esphome-2026.7.3-source-date-epoch.patch"
+PATCH_SHA256=d1e118a2ba2c8eeb261d6b643ccd7820a9395e771c9bc53433192442255fb741
+UPSTREAM_SHA256=31c9f9b479c7fd0b4d42ff484f58245e9c313f998fc8ec6db177518ce52e1d43
+PATCHED_SHA256=1c2e07a2e634914762bacbbb055c9784ecea5e153b0eedc408b20eb371236b8e
+
+if [ "$#" -gt 1 ]; then
+  printf '%s\n' "usage: $0 [PYTHON]" >&2
+  exit 2
+fi
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+  printf '%s\n' "Python interpreter is unavailable: $PYTHON" >&2
+  exit 1
+fi
+if ! command -v patch >/dev/null 2>&1 || \
+  ! patch --version | grep -m1 -Fxq "GNU patch 2.7.6"; then
+  printf '%s\n' "GNU patch 2.7.6 is required for the ESPHome source patch" >&2
+  exit 1
+fi
+
+ACTUAL_PATCH_SHA256=$(sha256sum "$PATCH_FILE")
+ACTUAL_PATCH_SHA256=${ACTUAL_PATCH_SHA256%% *}
+if [ "$ACTUAL_PATCH_SHA256" != "$PATCH_SHA256" ]; then
+  printf '%s\n' "ESPHome SOURCE_DATE_EPOCH patch hash differs" >&2
+  exit 1
+fi
+
+ESPHOME_VERSION=$("$PYTHON" -c \
+  'from importlib.metadata import version; print(version("esphome"))')
+if [ "$ESPHOME_VERSION" != "2026.7.3" ]; then
+  printf '%s\n' "refusing to patch ESPHome $ESPHOME_VERSION; expected 2026.7.3" >&2
+  exit 1
+fi
+WRITER=$("$PYTHON" -c \
+  'import esphome; from pathlib import Path; print(Path(esphome.__file__).with_name("writer.py"))')
+if [ ! -f "$WRITER" ] || [ -L "$WRITER" ]; then
+  printf '%s\n' "ESPHome writer.py patch target is not a regular file" >&2
+  exit 1
+fi
+
+CURRENT_SHA256=$(sha256sum "$WRITER")
+CURRENT_SHA256=${CURRENT_SHA256%% *}
+case "$CURRENT_SHA256" in
+  "$PATCHED_SHA256")
+    ;;
+  "$UPSTREAM_SHA256")
+    SITE_PACKAGES=$(dirname -- "$(dirname -- "$WRITER")")
+    patch --batch --forward --fuzz=0 -d "$SITE_PACKAGES" -p1 < "$PATCH_FILE"
+    ;;
+  *)
+    printf '%s\n' \
+      "ESPHome 2026.7.3 writer.py differs from the pinned patch target" >&2
+    exit 1
+    ;;
+esac
+
+CURRENT_SHA256=$(sha256sum "$WRITER")
+CURRENT_SHA256=${CURRENT_SHA256%% *}
+if [ "$CURRENT_SHA256" != "$PATCHED_SHA256" ] || \
+  ! grep -Fxq '    build_time = int(os.environ["SOURCE_DATE_EPOCH"])' "$WRITER"; then
+  printf '%s\n' "ESPHome SOURCE_DATE_EPOCH patch result differs" >&2
+  exit 1
+fi
+
+printf '%s\n' \
+  "Verified ESPHome 2026.7.3 SOURCE_DATE_EPOCH patch: $CURRENT_SHA256"

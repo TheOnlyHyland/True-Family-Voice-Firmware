@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Docs / setup help
-    url: https://github.com/TristanBrotherton/voicepe-realtime/blob/main/docs/faq.md
-    about: All documentation lives in the main repo — check the FAQ first.
+    url: https://github.com/TheOnlyHyland/True-Family-Voice-Firmware/blob/0.19.0/INSTALL.md
+    about: Read this repository's secure installation guide first.

@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 3 ]; then
+  printf '%s\n' "usage: $0 VERSION PACKAGE_DIRECTORY OUTPUT" >&2
+  exit 2
+fi
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+VERSION=$1
+PACKAGE=$2
+OUTPUT=$3
+
+python3 "$ROOT/scripts/verify-release-package.py" "$VERSION" "$PACKAGE" >/dev/null
+if [ -e "$OUTPUT" ]; then
+  printf '%s\n' "refusing to replace channel manifest: $OUTPUT" >&2
+  exit 1
+fi
+
+jq --arg version "$VERSION" \
+  '.builds[].ota.path |= $version + "/" + . |
+   (.builds[].parts // [])[].path |= $version + "/" + .' \
+  "$PACKAGE/manifest.json" > "$OUTPUT"
+
+jq -e --arg version "$VERSION" \
+  '.version == $version and
+   (.builds | length) == 1 and
+   (.builds[0].ota.path | startswith($version + "/")) and
+   (.builds[0].parts | length) == 1 and
+   (.builds[0].parts[0].path | startswith($version + "/"))' \
+  "$OUTPUT" >/dev/null
+
+printf '%s\n' "Generated channel manifest from immutable package $VERSION."

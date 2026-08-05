@@ -1,0 +1,112 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$ROOT"
+. "$ROOT/scripts/deterministic-build-env"
+
+mkdir -p tests/build
+sh "$ROOT/scripts/verify-version" >/dev/null
+INSTALLER_TMP=$(mktemp -d)
+trap 'rm -rf "$INSTALLER_TMP"' EXIT HUP INT TERM
+sh "$ROOT/scripts/vendor-installer" "$INSTALLER_TMP/esp-web-tools"
+sh "$ROOT/scripts/run-actionlint"
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic -pthread -I. \
+  tests/follow_up_safety_test.cpp \
+  -o tests/build/follow_up_safety_test
+tests/build/follow_up_safety_test
+g++ -std=c++17 -Wall -Wextra -Werror -pedantic \
+  -fsanitize=undefined -fno-sanitize-recover=all -pthread -I. \
+  tests/follow_up_safety_test.cpp \
+  -o tests/build/follow_up_safety_test_ubsan
+tests/build/follow_up_safety_test_ubsan
+node tests/installer_security_test.mjs "$INSTALLER_TMP/esp-web-tools"
+python3 -m unittest discover -s tests -p "test_*.py"
+
+if [ "${1:-}" != "--compile" ]; then
+  exit 0
+fi
+
+if ! command -v esphome >/dev/null 2>&1; then
+  printf '%s\n' "esphome is required for --compile" >&2
+  exit 1
+fi
+
+# Keep concurrent agent runs from starting multiple memory-heavy compilers.
+# Never fall through to an unlocked compile on a host without flock.
+if ! command -v flock >/dev/null 2>&1; then
+  printf '%s\n' "flock is required for the ESPHome compile lock" >&2
+  exit 1
+fi
+if ! command -v patch >/dev/null 2>&1 || \
+  ! patch --version | grep -m1 -Fxq "GNU patch 2.7.6"; then
+  printf '%s\n' "GNU patch 2.7.6 is required for the ESPHome compile" >&2
+  exit 1
+fi
+exec 9>"${TMPDIR:-/tmp}/true-family-voice-esphome-compile.lock"
+flock 9
+
+# Keep compiler memory away from browser-heavy OpenCode verification sessions.
+if command -v pgrep >/dev/null 2>&1 && pgrep -x chromium >/dev/null 2>&1; then
+  printf '%s\n' "refusing ESPHome compile while Chromium workers are active" >&2
+  exit 1
+fi
+MEM_AVAILABLE_KIB=
+while read -r key value _unit; do
+  if [ "$key" = "MemAvailable:" ]; then
+    MEM_AVAILABLE_KIB=$value
+    break
+  fi
+done < /proc/meminfo
+if [ -z "$MEM_AVAILABLE_KIB" ] || [ "$MEM_AVAILABLE_KIB" -lt 4718592 ]; then
+  printf '%s\n' \
+    "refusing ESPHome compile with less than 4.5 GiB memory available" >&2
+  exit 1
+fi
+
+sh "$ROOT/scripts/apply-esphome-source-date-epoch-patch" python3
+sh "$ROOT/scripts/verify-external-inputs"
+FACTORY_CONFIG=tests/build/factory-config.yaml
+FACTORY_ALIAS_CONFIG=tests/build/factory-alias-config.yaml
+cmp home-assistant-voice.realtime.factory.yaml home-assistant-voice.factory.yaml
+esphome clean home-assistant-voice.realtime.factory.yaml
+esphome config home-assistant-voice.realtime.factory.yaml > "$FACTORY_CONFIG"
+esphome config home-assistant-voice.factory.yaml > "$FACTORY_ALIAS_CONFIG"
+for resolved_factory in "$FACTORY_CONFIG" "$FACTORY_ALIAS_CONFIG"; do
+  if grep -q '^api:' "$resolved_factory"; then
+    printf '%s\n' "generic factory unexpectedly exposes ESPHome native API" >&2
+    exit 1
+  fi
+  if grep -q 'platform: esphome' "$resolved_factory"; then
+    printf '%s\n' "generic factory unexpectedly exposes ESPHome native OTA" >&2
+    exit 1
+  fi
+done
+python3 "$ROOT/scripts/compare-yaml.py" "$FACTORY_CONFIG" "$FACTORY_ALIAS_CONFIG"
+esphome compile home-assistant-voice.realtime.factory.yaml
+python3 "$ROOT/scripts/verify-idf-component-lock.py"
+python3 "$ROOT/scripts/verify-resolved-inputs.py"
+
+FACTORY_BIN=.esphome/build/true-family-voice/build/firmware.factory.bin
+BUILD_INFO=.esphome/build/true-family-voice/src/esphome/core/build_info_data.cpp
+EXPECTED_BUILD_TIME=$(TZ=UTC0 date -d "@$SOURCE_DATE_EPOCH" '+%Y-%m-%d %H:%M:%S %z')
+grep -Fxq "const time_t ESPHOME_BUILD_TIME = $SOURCE_DATE_EPOCH;  // NOLINT" \
+  "$BUILD_INFO"
+grep -Fxq \
+  "const char ESPHOME_BUILD_TIME_STR[] = \"$EXPECTED_BUILD_TIME\";" \
+  "$BUILD_INFO"
+if strings "$FACTORY_BIN" | grep -q "compile-only"; then
+  printf '%s\n' "generic factory artifact contains private compile credentials" >&2
+  exit 1
+fi
+if strings "$FACTORY_BIN" | grep -q '_esphomelib._tcp'; then
+  printf '%s\n' "generic factory binary advertises ESPHome native API" >&2
+  exit 1
+fi
+
+GENERATED=.esphome/build/true-family-voice/src/esphome/components/va_client
+for file in automation.h follow_up_lifecycle.h follow_up_safety.h va_client.cpp va_client.h; do
+  cmp "esphome/components/va_client/$file" "$GENERATED/$file"
+done
+
+printf '%s\n' "Verified generated va_client is byte-identical to the local candidate."

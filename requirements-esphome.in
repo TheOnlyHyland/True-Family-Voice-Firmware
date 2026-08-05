@@ -1,0 +1,5 @@
+esphome==2026.7.3
+# Keep the release candidate's already-tested transitive tool closure.
+argcomplete==3.7.0
+cffi==2.1.0
+packaging==26.2

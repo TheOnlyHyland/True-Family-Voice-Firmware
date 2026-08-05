@@ -36,6 +36,7 @@ Icon
 build/
 develop-eggs/
 dist/
+/output/
 downloads/
 eggs/
 .eggs/
@@ -144,3 +145,5 @@ sdkconfig.*
 
 # ESPHome secrets (per-device credentials, do not commit)
 secrets.yaml
+/home-assistant-voice.live.yaml
+/static/vendor/

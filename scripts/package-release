@@ -1,0 +1,97 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  printf '%s\n' "usage: $0 VERSION" >&2
+  exit 2
+fi
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$ROOT/scripts/deterministic-build-env"
+VERSION=$1
+EXPECTED_VERSION=$(tr -d '\r\n' < "$ROOT/VERSION")
+if [ "$VERSION" != "$EXPECTED_VERSION" ]; then
+  printf '%s\n' "refusing package version $VERSION; firmware embeds $EXPECTED_VERSION" >&2
+  exit 1
+fi
+BUILD="$ROOT/.esphome/build/true-family-voice/build"
+BUILD_INFO="$ROOT/.esphome/build/true-family-voice/src/esphome/core/build_info_data.cpp"
+DEST="$ROOT/output/$VERSION"
+BASE=true-family-voice-esp32s3
+
+if ! grep -Fxq \
+  "const time_t ESPHOME_BUILD_TIME = $SOURCE_DATE_EPOCH;  // NOLINT" \
+  "$BUILD_INFO"; then
+  printf '%s\n' "compiled build timestamp does not match SOURCE_DATE_EPOCH" >&2
+  exit 1
+fi
+
+for file in firmware.factory.bin firmware.ota.bin firmware.elf; do
+  if [ ! -f "$BUILD/$file" ]; then
+    printf '%s\n' "missing exact compiled artifact: $BUILD/$file" >&2
+    exit 1
+  fi
+done
+
+if [ -e "$ROOT/output" ]; then
+  printf '%s\n' "refusing to replace existing release output: $ROOT/output" >&2
+  exit 1
+fi
+mkdir -p "$DEST"
+cp "$BUILD/firmware.factory.bin" "$DEST/$BASE.factory.bin"
+cp "$BUILD/firmware.ota.bin" "$DEST/$BASE.ota.bin"
+cp "$BUILD/firmware.elf" "$DEST/$BASE.elf"
+cmp "$BUILD/firmware.factory.bin" "$DEST/$BASE.factory.bin"
+cmp "$BUILD/firmware.ota.bin" "$DEST/$BASE.ota.bin"
+cmp "$BUILD/firmware.elf" "$DEST/$BASE.elf"
+
+FACTORY_SHA=$(sha256sum "$DEST/$BASE.factory.bin")
+FACTORY_SHA=${FACTORY_SHA%% *}
+FACTORY_MD5=$(md5sum "$DEST/$BASE.factory.bin")
+FACTORY_MD5=${FACTORY_MD5%% *}
+OTA_SHA=$(sha256sum "$DEST/$BASE.ota.bin")
+OTA_SHA=${OTA_SHA%% *}
+OTA_MD5=$(md5sum "$DEST/$BASE.ota.bin")
+OTA_MD5=${OTA_MD5%% *}
+
+jq -n \
+  --arg version "$VERSION" \
+  --arg factory_path "$BASE.factory.bin" \
+  --arg factory_md5 "$FACTORY_MD5" \
+  --arg factory_sha "$FACTORY_SHA" \
+  --arg ota_path "$BASE.ota.bin" \
+  --arg ota_md5 "$OTA_MD5" \
+  --arg ota_sha "$OTA_SHA" \
+  '{
+    name: "True Tech Solutions.True Family Voice Realtime",
+    version: $version,
+    home_assistant_domain: "esphome",
+    new_install_prompt_erase: false,
+    builds: [
+      {
+        chipFamily: "ESP32-S3",
+        ota: {
+          path: $ota_path,
+          md5: $ota_md5,
+          sha256: $ota_sha
+        },
+        parts: [
+          {
+            path: $factory_path,
+            offset: 0,
+            md5: $factory_md5,
+            sha256: $factory_sha
+          }
+        ]
+      }
+    ]
+  }' > "$DEST/manifest.json"
+
+(
+  cd "$DEST"
+  sha256sum "$BASE.factory.bin" "$BASE.ota.bin" "$BASE.elf" manifest.json > SHA256SUMS
+)
+
+python3 "$ROOT/scripts/verify-release-package.py" "$VERSION" "$DEST"
+
+printf '%s\n' "Packaged the exact verified build in $DEST"

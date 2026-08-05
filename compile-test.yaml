@@ -1,10 +1,16 @@
 substitutions:
-  name: true-family-voice-compile-test
-  friendly_name: "True Family Voice Compile Test"
+  name: home-assistant-voice
+  friendly_name: "True Family Voice Realtime"
   wifi_ssid: "compile-only"
   wifi_password: "compile-only-password"
+  api_encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
   ota_password: "compile-only-ota-password"
-  va_url: "ws://192.0.2.1:8080/"
+  # Keep the promoted generic artifact functional after Wi-Fi provisioning.
+  va_url: "ws://homeassistant.local:8080/"
+  # The deployable Realtime YAML is compiled unchanged except for resolving its
+  # va_client source to this checkout rather than the published release tag.
+  va_client_source: esphome/components
 
 packages:
   realtime: !include home-assistant-voice.realtime.yaml
+  adopted: !include home-assistant-voice.adopted.yaml

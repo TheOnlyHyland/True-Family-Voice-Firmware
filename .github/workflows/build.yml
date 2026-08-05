@@ -5,9 +5,16 @@ on:
     branches:
       - dev
   pull_request:
-  workflow_dispatch:
-  release:
-    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  LANG: "C"
+  LC_ALL: "C"
+  PYTHONHASHSEED: "0"
+  SOURCE_DATE_EPOCH: "1785888000"
+  TZ: "UTC0"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -15,102 +22,93 @@ concurrency:
 
 jobs:
   build-firmware:
-    name: Build Firmware
-    uses: esphome/workflows/.github/workflows/build.yml@025a1e6255610c498ed590403b7e510b69e474df  # 2026.4.1
-    with:
-      files: |
-        home-assistant-voice.factory.yaml
-        home-assistant-voice.8mb.yaml
-      esphome-version: 2026.5.0
-      release-summary: ${{ github.event_name == 'release' && github.event.release.body || '' }}
-      release-url: ${{ github.event_name == 'release' && github.event.release.html_url || '' }}
-      release-version: ${{ github.event_name == 'release' && github.event.release.tag_name || '' }}
+    name: Verify, Compile, and Package Exact Realtime Firmware
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out candidate
+        # actions/checkout v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Require exact embedded version
+        id: version
+        shell: bash
+        run: |
+          version=$(sh ./scripts/verify-version)
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Set up pinned Python
+        # actions/setup-python v6.2.0
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13.5"
+          cache: pip
+          cache-dependency-path: |
+            requirements-build.txt
+            requirements-esphome.txt
+      - name: Install locked Python build tools
+        run: >-
+          python -m pip install --disable-pip-version-check --require-hashes
+          --only-binary=:all: --upgrade -r requirements-build.txt
+      - name: Install locked ESPHome dependency closure
+        run: >-
+          python -m pip install --disable-pip-version-check --require-hashes
+          --no-build-isolation -r requirements-esphome.txt
+      - name: Install checksum-locked GNU patch 2.7.6
+        run: |
+          sh ./scripts/install-gnu-patch "$RUNNER_TEMP/gnu-patch-2.7.6"
+          printf '%s\n' "$RUNNER_TEMP/gnu-patch-2.7.6/bin" >> "$GITHUB_PATH"
+      - name: Apply checksum-bound ESPHome build timestamp patch
+        run: sh ./scripts/apply-esphome-source-date-epoch-patch python
+      - name: Test inputs and compile exact generic Realtime source once
+        run: ./scripts/verify --compile
+      - name: Package exact compiled bytes without rebuilding
+        run: sh ./scripts/package-release "${{ steps.version.outputs.version }}"
+      - name: Upload CI package
+        id: upload
+        # actions/upload-artifact v4.6.0
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: home-assistant-voice-ci-${{ github.sha }}
+          path: output
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: false
 
   comment:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.owner.login == 'esphome'
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.owner.login == github.repository_owner
     name: Comment on PR
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - build-firmware
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Comment on PR
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        # actions/github-script v9.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
         with:
           script: |-
+            const expectedName = `home-assistant-voice-ci-${context.sha}`
             const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
               owner: context.repo.owner,
               repo: context.repo.repo,
               run_id: context.runId,
             })
-            const artifact = artifacts['data']['artifacts'].find(a => a.name === 'home-assistant-voice')
-            const url = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact['id']}`
+            const artifact = artifacts.data.artifacts.find(
+              (candidate) => candidate.name === expectedName,
+            )
+            if (!artifact) {
+              core.setFailed(`Missing CI artifact ${expectedName}`)
+              return
+            }
+            const url = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/artifacts/${artifact.id}`
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `Firmware built successfully! :tada:
-
-            [Download][download] and extract the firmware to install with https://web.esphome.io
-
-            Make sure to choose \`home-assistant-voice-esp32s3.factory.bin\`.
-
-            [download]: ${url}`
+              body: `Firmware built successfully.\n\n[Download the exact CI package](${url}) and install the factory binary with https://web.esphome.io. This CI artifact is not eligible for release publication.`,
             })
-
-  upload-to-r2:
-    if: github.event_name == 'release'
-    name: Upload to R2
-    needs:
-      - build-firmware
-    uses: esphome/workflows/.github/workflows/upload-to-r2.yml@025a1e6255610c498ed590403b7e510b69e474df  # 2026.4.1
-    with:
-      directory: ${{ github.event.repository.name }}
-    secrets: inherit
-
-  summary:
-    if: github.event_name == 'release'
-    name: Generate Summary
-    runs-on: ubuntu-latest
-    needs:
-      - upload-to-r2
-    steps:
-      - name: Generate
-        run: |-
-          echo "## Firmware built successfully!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "[Install here](https://esphome.github.io/${{ github.event.repository.name }}/?version=${{ github.event.release.tag_name }}) and test **before** approving deployment to beta or production." >> $GITHUB_STEP_SUMMARY
-
-  upload-to-release:
-    name: Upload to Release
-    if: github.event_name == 'release'
-    uses: esphome/workflows/.github/workflows/upload-to-gh-release.yml@025a1e6255610c498ed590403b7e510b69e474df  # 2026.4.1
-    needs:
-      - build-firmware
-    with:
-      version: ${{ github.event.release.tag_name }}
-
-  promote-beta:
-    name: Promote to Beta
-    if: github.event_name == 'release'
-    uses: esphome/workflows/.github/workflows/promote-r2.yml@025a1e6255610c498ed590403b7e510b69e474df  # 2026.4.1
-    needs:
-      - upload-to-r2
-    with:
-      version: ${{ github.event.release.tag_name }}
-      directory: ${{ github.event.repository.name }}
-      channel: beta
-      manifest-filename: manifest-beta.json
-    secrets: inherit
-
-  promote-prod:
-    name: Promote to Production
-    if: github.event_name == 'release' && github.event.release.prerelease == false
-    uses: esphome/workflows/.github/workflows/promote-r2.yml@025a1e6255610c498ed590403b7e510b69e474df  # 2026.4.1
-    needs:
-      - upload-to-r2
-    with:
-      version: ${{ github.event.release.tag_name }}
-      directory: ${{ github.event.repository.name }}
-      channel: production
-      manifest-filename: manifest.json
-    secrets: inherit

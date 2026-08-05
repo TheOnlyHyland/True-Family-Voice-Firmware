@@ -1,0 +1,14 @@
+# Private-device overlay. Include this with home-assistant-voice.realtime.yaml
+# only from a local ESPHome stub that supplies both values from secrets.yaml.
+api:
+  encryption:
+    key: ${api_encryption_key}
+  on_client_connected:
+    - script.execute: control_leds
+  on_client_disconnected:
+    - script.execute: control_leds
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+    password: ${ota_password}

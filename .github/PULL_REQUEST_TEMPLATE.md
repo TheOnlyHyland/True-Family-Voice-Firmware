@@ -13,6 +13,6 @@
 
 - [ ] One change per PR (no drive-by refactors/reformatting)
 - [ ] I ran this on real hardware and can answer questions about it
-- [ ] Docs updated (`docs/configuration.md` / `docs/features.md`) if user-visible
+- [ ] `README.md` / `INSTALL.md` updated if user-visible
 - [ ] `CHANGELOG.md` entry if user-visible
 - [ ] No personal info: generic names, placeholder IPs, no real tokens
