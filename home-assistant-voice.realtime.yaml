@@ -3,18 +3,19 @@
 # Our customized thin-client: all voice logic lives in the va_client component
 # (pulled from GitHub), streaming audio to the OpenAI Realtime backend add-on.
 #
-# This config is meant to be pulled as a remote ESPHome `packages:` include from
-# a small per-device stub, so updates are one click in the dashboard (no more
-# copy-pasting the whole file). The stub provides the device identity + secrets
-# as SUBSTITUTIONS (a remote package can't use !secret):
-#   name, friendly_name, wifi_ssid, wifi_password, ota_password
+# This config is pulled as a remote ESPHome `packages:` include from a small
+# per-device stub. Its immutable `0.19.0` refs do not auto-discover later releases;
+# an update requires deliberate ref advancement or re-adoption. The
+# stub provides the device identity + secrets as SUBSTITUTIONS (a remote package
+# can't use !secret):
+#   name, friendly_name, wifi_ssid, wifi_password
 #   (+ static_ip/gateway/subnet/dns1/dns2 and a manual_ip override for a fixed IP)
 # See esphome-builder.dhcp.yaml in this repo for the stub template.
 # ============================================================================
 substitutions:
   # Device identity comes from the per-device stub (esphome-builder.dhcp.yaml); these
-  # are safe defaults the stub overrides. Wi-Fi + secrets (wifi_ssid, wifi_password,
-  # ota_password) MUST be provided by the stub as substitutions, because
+  # are safe defaults the stub overrides. Wi-Fi secrets (wifi_ssid, wifi_password)
+  # MUST be provided by the stub as substitutions, because
   # a remote `packages:` include can't use !secret.
   name: home-assistant-voice
   friendly_name: Home Assistant Voice
@@ -35,7 +36,7 @@ substitutions:
   # DEFAULT WAKE WORD: "HEY LEONARD" — a custom model trained by this project
   # (see models/ and the README). Switch to Hey Jarvis / Okay Nabu at runtime
   # via the device's "Wake word" dropdown in Home Assistant — no reflash.
-  wake_word_model: "github://TheOnlyHyland/True-Family-Voice-Firmware/models/hey_leonard.json@main"
+  wake_word_model: "models/hey_leonard.json"
   default_wake_word: "Hey Leonard"
   # Runtime sensitivity cutoffs (uint8 = round(p*255)) for Slightly/Moderately/
   # Very. Stock-model defaults; custom models override with calibrated values.
@@ -49,24 +50,26 @@ substitutions:
   # Change this to true in case you ahve a hidden SSID at home.
   hidden_ssid: "false"
   # Substitutions for audio files
-  jack_connected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_connected.flac
-  jack_disconnected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_disconnected.flac
-  mute_switch_on_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_on.flac
-  mute_switch_off_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_off.flac
+  voice_pe_source_ref: "0579e7b9d8504264719c593474c85447253c9dc1"
+  jack_connected_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/jack_connected.flac
+  jack_disconnected_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/jack_disconnected.flac
+  mute_switch_on_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/mute_switch_on.flac
+  mute_switch_off_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/mute_switch_off.flac
   # Gentle two-tone bell (synthesized, ~-14 dBFS) — the stock ring was "a
-  # little intense" for a kitchen. Original: .../esphome/home-assistant-voice-pe/raw/dev/sounds/timer_finished.flac
-  timer_finished_sound_file: https://raw.githubusercontent.com/TheOnlyHyland/True-Family-Voice-Firmware/main/sounds/gentle_timer.flac
-  wake_word_triggered_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
-  center_button_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_press.flac
-  center_button_double_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_double_press.flac
-  center_button_triple_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_triple_press.flac
-  center_button_long_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_long_press.flac
-  factory_reset_initiated_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/factory_reset_initiated.mp3
-  factory_reset_cancelled_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/factory_reset_cancelled.mp3
-  factory_reset_confirmed_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/factory_reset_confirmed.mp3
-  easter_egg_tick_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tick.mp3
-  easter_egg_tada_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tada.mp3
-  error_cloud_expired_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/error_cloud_expired.mp3
+  # little intense" for a kitchen. The stock timer sound remains available in
+  # the immutable upstream source commit recorded below.
+  timer_finished_sound_file: sounds/gentle_timer.flac
+  wake_word_triggered_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/wake_word_triggered.flac
+  center_button_press_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/center_button_press.flac
+  center_button_double_press_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/center_button_double_press.flac
+  center_button_triple_press_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/center_button_triple_press.flac
+  center_button_long_press_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/center_button_long_press.flac
+  factory_reset_initiated_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/factory_reset_initiated.mp3
+  factory_reset_cancelled_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/factory_reset_cancelled.mp3
+  factory_reset_confirmed_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/factory_reset_confirmed.mp3
+  easter_egg_tick_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/easter_egg_tick.mp3
+  easter_egg_tada_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/easter_egg_tada.mp3
+  error_cloud_expired_sound_file: https://raw.githubusercontent.com/esphome/home-assistant-voice-pe/${voice_pe_source_ref}/sounds/error_cloud_expired.mp3
   # WebSocket endpoint of the "OpenAI Realtime Voice Agent" Home Assistant
   # add-on (this fork's backend). The add-on runs with host_network and
   # listens on port 8080. homeassistant.local resolves via mDNS on the LAN;
@@ -74,16 +77,20 @@ substitutions:
   # "ws://192.168.1.10:8080/".
   va_url: "ws://homeassistant.local:8080/"
   # (device→add-on WebSocket needs no auth token; it's a LAN-local service.)
+  # Published packages resolve va_client from the matching immutable release.
+  # The generic factory target overrides this with the checked-out source.
+  va_client_source: "github://TheOnlyHyland/True-Family-Voice-Firmware@0.19.0"
 
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  compile_process_limit: 1
   name_add_mac_suffix: false
-  # Project identity drives the ESPHome dashboard "Update available" badge: bump
-  # `version` on a release (merge to main) and adopted devices are offered it.
+  # Bump the project version and every immutable package/stub ref together for
+  # each release. Adopted devices compile only an explicitly selected tag.
   project:
     name: "true_tech_solutions.true_family_voice"
-    version: "0.18.0"
+    version: "0.19.0"
   min_version: 2026.5.0
   on_boot:
     priority: 375
@@ -93,9 +100,9 @@ esphome:
       - delay: 1s
       - switch.turn_on: internal_speaker_amp
       # va-direct: original on_client_connected did clear-init + start-mww +
-      # phase=idle. clear-init + phase=idle stay here; micro_wake_word.start
-      # moved to api.on_client_connected (see above) because on_boot+1s raced
-      # the XMOS voice-kit and mWW never heard the mic. The control_leds
+      # phase=idle. clear-init + phase=idle stay here; micro_wake_word.start is
+      # driven by va_client's admitted WS idle phase so the public factory does
+      # not require an unauthenticated native API. The control_leds
       # dispatcher routes to no_ha_connection (red twinkle) until both wifi and
       # va_client WS come up — then it falls through to the idle phase naturally.
       - lambda: id(init_in_progress) = false;
@@ -124,7 +131,7 @@ esp32:
   flash_size: 16MB
   framework:
     type: esp-idf
-    version: recommended
+    version: "5.5.5"
     sdkconfig_options:
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
@@ -140,7 +147,8 @@ esp32:
       CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
 
       CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
-      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y" # TLS1.3 support isn't enabled by default in IDF 5.1.5
+      # TLS1.3 is not enabled by default.
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"
 
 wifi:
   id: wifi_id
@@ -158,7 +166,8 @@ wifi:
   ap:
     ssid: "Voice PE Setup"
   on_connect:
-    - delay: 5s # give improv results time to transmit
+    # Give improv results time to transmit.
+    - delay: 5s
     - ble.disable:
     - lambda: id(improv_ble_in_progress) = false;
     - script.execute: control_leds
@@ -179,35 +188,8 @@ network:
 logger:
   level: INFO
   logs:
-    sensor: WARN # avoids logging debug sensor updates
-
-ota:
-  - platform: esphome
-    id: ota_esphome
-    # OTA upload password (from the stub's ota_password substitution -> secrets.yaml).
-    password: ${ota_password}
-
-# va-direct fork: api re-enabled so this device shows up in Home Assistant
-# again (entities, OTA discovery, and diagnostics readable from HA). Voice
-# audio still flows over the va_client WebSocket and tools via the MCP server
-# on the backend — api only manages/observes the device itself. With api on,
-# ESPHome advertises _esphomelib over mDNS automatically, so the old manual
-# mdns workaround is no longer needed.
-api:
-  # va-direct: start micro_wake_word HERE (mirrors stock home-assistant-voice.yaml
-  # and the fjfricke reference) instead of on_boot. Starting mWW at on_boot+1s
-  # raced the XMOS voice-kit coming up, so mWW could begin reading a mic that
-  # wasn't streaming yet and never recover — the wake word silently never fired.
-  # on_client_connected runs once HA + WiFi + the audio path are fully up.
-  on_client_connected:
-    - micro_wake_word.start:
-    # Keep "stop" disabled in the resting/idle state; on_phase arms it only while
-    # the assistant is replying. Explicit here so the boot state is deterministic
-    # regardless of whether the HA api or the va_client WS connects first.
-    - micro_wake_word.disable_model: stop
-    - script.execute: control_leds
-  on_client_disconnected:
-    - script.execute: control_leds
+    # Avoid logging debug sensor updates.
+    sensor: WARN
 
 # Diagnostics surfaced to Home Assistant (so they can be read remotely without
 # a serial cable): the last reset reason (e.g. "Task watchdog" / "Software" /
@@ -266,7 +248,8 @@ i2c:
 psram:
   mode: octal
   speed: 80MHz
-  ignore_not_found: false # The VPE has PSRAM, so this is safe. Allows configuring WiFi driver to use more resources (done automatically by the speaker media player)
+  # The VPE always has PSRAM.
+  ignore_not_found: false
 
 globals:
   # Global index for our LEDs. So that switching between different animation does not lead to unwanted effects.
@@ -363,6 +346,9 @@ switch:
     # lambda republishes when hardware_mute_switch flips), so the session
     # cut-off below covers both paths.
     on_turn_on:
+      # Mute revokes any pending/open explicit follow-up even while the reply is
+      # still playing. It deliberately does not stop speaker playback.
+      - lambda: "id(va)->revoke_for_mute();"
       # Muting must also END an active LISTENING session (the wake window or
       # the post-reply follow-up window): the mic gate would otherwise stay
       # open streaming dead air, with the ring stuck on "listening" until a
@@ -378,6 +364,7 @@ switch:
             - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
       - script.execute: control_leds
     on_turn_off:
+      - lambda: "id(va)->release_mute();"
       - script.execute: control_leds
   # Wake Word Sound Switch.
   - platform: template
@@ -492,79 +479,68 @@ binary_sensor:
                     then:
                       - lambda: "id(va)->enroll_stop(true);"
                       - script.execute: control_leds
-                - if:
-                    condition:
-                      switch.is_on: timer_ringing
-                    then:
-                      - switch.turn_off: timer_ringing
                     else:
                       - if:
                           condition:
-                            media_player.is_announcing:
-                              id: external_media_player
+                            switch.is_on: timer_ringing
                           then:
-                            media_player.stop:
-                              announcement: true
-                              id: external_media_player
+                            - switch.turn_off: timer_ringing
                           else:
-                            # Abort order (fork fix): a live assistant session
-                            # outranks music — the press silences the voice
-                            # FIRST. (Stock structure paused music first,
-                            # leaving the assistant talking.)
                             - if:
                                 condition:
-                                  lambda: "return id(voice_assistant_phase) != ${voice_assist_idle_phase_id};"
+                                  media_player.is_announcing:
+                                    id: external_media_player
                                 then:
-                                  - lambda: "id(va)->send_interrupt();"
-                                  # Fast button-silence after a wake = the
-                                  # user shutting up a false trigger; tell
-                                  # the backend so it can flag the capture.
-                                  - lambda: "id(va)->send_button_cancel();"
-                                  - speaker.stop:
-                                      id: media_resampling_speaker
-                                  - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
-                                  - script.execute: control_leds
+                                  - media_player.stop:
+                                      announcement: true
+                                      id: external_media_player
                                 else:
-                                  # Backend TTS with NO session (timer expiry
-                                  # announcements, agent report-backs) plays
-                                  # through the raw speaker lane in idle phase.
-                                  # The press stops it and acks the backend
-                                  # (silences a timer's ring-after-grace).
-                                  # Previously this case STARTED a session.
+                                  # Abort order (fork fix): a live assistant
+                                  # session outranks music. The press silences
+                                  # the voice first.
                                   - if:
                                       condition:
-                                        speaker.is_playing: media_resampling_speaker
+                                        lambda: "return id(voice_assistant_phase) != ${voice_assist_idle_phase_id};"
                                       then:
+                                        - lambda: "id(va)->send_interrupt();"
+                                        # Fast button-silence after a wake = a
+                                        # false-trigger flag for the backend.
+                                        - lambda: "id(va)->send_button_cancel();"
                                         - speaker.stop:
                                             id: media_resampling_speaker
-                                        - lambda: "id(va)->send_button_cancel();"
+                                        - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
+                                        - script.execute: control_leds
                                       else:
+                                        # Backend TTS with no session (timer
+                                        # expiry or agent report-back) uses the
+                                        # raw speaker lane in idle phase.
                                         - if:
                                             condition:
-                                              media_player.is_playing:
-                                                id: external_media_player
+                                              speaker.is_playing: media_resampling_speaker
                                             then:
-                                              - media_player.pause:
-                                                  id: external_media_player
+                                              - speaker.stop:
+                                                  id: media_resampling_speaker
+                                              - lambda: "id(va)->send_button_cancel();"
                                             else:
                                               - if:
                                                   condition:
-                                                    switch.is_off: master_mute_switch
+                                                    media_player.is_playing:
+                                                      id: external_media_player
                                                   then:
-                                                    - script.execute:
-                                                        id: play_sound
-                                                        priority: true
-                                                        sound_file: "center_button_press_sound"
-                                                    - wait_until:
+                                                    - media_player.pause:
+                                                        id: external_media_player
+                                                  else:
+                                                    - if:
                                                         condition:
-                                                          not:
-                                                            media_player.is_announcing:
-                                                              id: external_media_player
-                                                        timeout: 2s
-                                                    - delay: 600ms
-                                                    - lambda: "id(va)->start_session();"
-                                                    - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
-                                                    - script.execute: control_leds
+                                                          switch.is_off: master_mute_switch
+                                                        then:
+                                                          - script.execute:
+                                                              id: guarded_wake_start
+                                                              wake_reservation: !lambda |-
+                                                                return id(va)->prepare_local_wake();
+                                                              listening_phase: false
+                                                              play_chime: true
+                                                              sound_file: "center_button_press_sound"
       # Double Click
       #  . Exposed as an event entity. To be used in automations inside Home Assistant
       - timing:
@@ -1308,6 +1284,65 @@ script:
       - binary_sensor.template.publish:
           id: wake_detected_pulse
           state: false
+  # Every delayed chime path carries the generation created by the physical
+  # wake. Mute, stop, reconnect, or a newer wake invalidates that generation.
+  - id: guarded_wake_start
+    mode: restart
+    parameters:
+      wake_reservation: int
+      listening_phase: bool
+      play_chime: bool
+      sound_file: string
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_off: master_mute_switch
+              - lambda: |-
+                  return wake_reservation > 0 &&
+                         id(va)->pending_wake_is_safe(wake_reservation);
+          then:
+            - if:
+                condition:
+                  lambda: "return play_chime;"
+                then:
+                  - script.execute:
+                      id: play_sound
+                      priority: true
+                      sound_file: !lambda "return sound_file;"
+                  - wait_until:
+                      condition:
+                        not:
+                          media_player.is_announcing:
+                            id: external_media_player
+                      timeout: 2s
+                  - delay: !lambda "return id(va)->get_wake_open_delay_ms();"
+            - if:
+                condition:
+                  and:
+                    - switch.is_off: master_mute_switch
+                    - not:
+                        media_player.is_announcing:
+                          id: external_media_player
+                    - lambda: |-
+                        return id(va)->pending_wake_is_safe(wake_reservation);
+                then:
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(va)->start_session(wake_reservation);
+                      then:
+                        - lambda: |-
+                            id(voice_assistant_phase) = listening_phase
+                                ? ${voice_assist_listening_for_command_phase_id}
+                                : ${voice_assist_waiting_for_command_phase_id};
+                        - script.execute: control_leds
+                      else:
+                        - lambda: "id(va)->abort_local_wake(wake_reservation);"
+                else:
+                  - lambda: "id(va)->abort_local_wake(wake_reservation);"
+          else:
+            - lambda: "id(va)->abort_local_wake(wake_reservation);"
   # Master script controlling the LEDs, based on different conditions : initialization in progress, wifi and api connected and voice assistant phase.
   # For the sake of simplicity and re-usability, the script calls child scripts defined below.
   # This script will be called every time one of these conditions is changing.
@@ -1621,7 +1656,8 @@ script:
   - id: control_volume
     mode: restart
     parameters:
-      increase_volume: bool # True: Increase volume / False: Decrease volume.
+      # True increases volume; false decreases it.
+      increase_volume: bool
     then:
       - delay: 16ms
       - if:
@@ -1645,7 +1681,8 @@ script:
   - id: control_group_volume
     mode: restart
     parameters:
-      increase_volume: bool # True: Increase volume / False: Decrease volume.
+      # True increases volume; false decreases it.
+      increase_volume: bool
     then:
       - delay: 16ms
       # TODO va-direct: no sendspin_group_media_player; group volume not supported.
@@ -1663,7 +1700,8 @@ script:
   - id: control_hue
     mode: restart
     parameters:
-      increase_hue: bool # True: Increase hue / False: Decrease hue.
+      # True increases hue; false decreases it.
+      increase_hue: bool
     then:
       - delay: 16ms
       - if:
@@ -1784,44 +1822,8 @@ script:
     then:
       - lambda: "id(is_timer_active) = false;  // TODO va-direct: no timer API on va_client yet"
 
-  # DEAD CODE (va-direct): in the original yaml this script enabled the
-  # stop wake word while external_media_player was announcing. We no
-  # longer route TTS through external_media_player, so the wait_until
-  # condition never fires. Stop word arming now lives in va_client's
-  # on_phase handler (enable on phase=replying, disable otherwise).
-  # Kept for diff readability with upstream; safe to delete once the
-  # va-direct yaml is the only one.
-  # Single disarm point for the "stop" wake word. Started on EVERY return to idle
-  # (on_phase) and by on_followup_opened (request_follow_up). It waits out the
-  # whole reply tail + follow-up listening window, then disarms "stop" — but only
-  # if no new turn started meanwhile (a new reply OR a `listening` turn-start
-  # calls script.stop on this; the turn's own return to idle restarts it).
-  # mode: restart so each idle / follow-up restarts the timer.
-  #
-  # 12 s comfortably covers both window types: the automatic follow-up
-  # (follow_up_listen_seconds, ~8 s) and a request_follow_up (kRequestFollowUpMs,
-  # ~10 s) plus the mic-open delay + buffer. In the gap between the window closing
-  # and this firing, "stop" stays armed but is a harmless no-op at idle.
-  - id: followup_window_watchdog
-    mode: restart
-    then:
-      - delay: 12000ms
-      # Still at rest (idle) or still in the listening window (user never spoke)?
-      # Then the turn + its follow-up are over — disarm stop and settle on idle.
-      # If a new reply started, phase is replying/thinking here, so we leave stop
-      # armed (and this watchdog was also cancelled on "replying").
-      - if:
-          condition:
-            lambda: |-
-              return id(voice_assistant_phase) == ${voice_assist_idle_phase_id} ||
-                     id(voice_assistant_phase) == ${voice_assist_listening_for_command_phase_id};
-          then:
-            - micro_wake_word.disable_model: stop
-            - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
-            - script.execute: control_leds
-
-  # (Removed: stock's `activate_stop_word_once` script — orphaned in this fork.
-  # "stop" arming is owned by va_client's on_phase + followup_window_watchdog.)
+# Stop-word and follow-up expiry now come only from generation-bound component
+# transitions. No delayed YAML watchdog can repaint or reopen a newer wake.
 
 i2s_audio:
   - id: i2s_output
@@ -1930,6 +1932,13 @@ media_player:
       - lambda: "id(va).set_volume(0.0f);"
     on_unmute:
       - lambda: "id(va).set_volume(1.0f);"
+    on_announcement:
+      - lambda: "id(va).set_announcement_active(true);"
+    on_state:
+      - lambda: |-
+          id(va).set_announcement_active(
+              id(external_media_player).state ==
+              media_player::MediaPlayerState::MEDIA_PLAYER_STATE_ANNOUNCING);
 
 sendspin:
   id: sendspin_hub
@@ -1980,7 +1989,8 @@ media_source:
     buffer_size: 500000
   - platform: sendspin
     id: sendspin_media_source
-    fixed_delay: 480 microseconds # The AIC3204 DAC used, as configured, on the VPE delays audio by 480 microseconds
+    # The configured AIC3204 DAC delay.
+    fixed_delay: 480 microseconds
 
 voice_kit:
   id: voice_kit_component
@@ -1996,16 +2006,13 @@ external_components:
   - source:
       type: git
       url: https://github.com/esphome/home-assistant-voice-pe
-      ref: dev
+      ref: 0579e7b9d8504264719c593474c85447253c9dc1
     components:
       - voice_kit
     refresh: 0s
-  # Build the modified va_client from the published True Family firmware
-  # repository.
-  - source:
-      type: git
-      url: https://github.com/TheOnlyHyland/True-Family-Voice-Firmware
-      ref: main
+  # The production default is this repository's matching immutable release.
+  # The local factory compile overrides va_client_source with this checkout.
+  - source: ${va_client_source}
     components:
       - va_client
     refresh: 0s
@@ -2043,6 +2050,7 @@ va_client:
   # announcements) from reaching the i2s output. The media lane is otherwise
   # unused (no music pipeline configured), so it's effectively ours.
   speaker: media_resampling_speaker
+  announcement_speaker: announcement_resampling_speaker
   on_phase:
     - lambda: |-
         if (phase == "idle") {
@@ -2073,7 +2081,6 @@ va_client:
           - micro_wake_word.disable_model: wake_jarvis
           - micro_wake_word.disable_model: wake_nabu
           - micro_wake_word.disable_model: stop
-          - script.stop: followup_window_watchdog
     - if:
         condition:
           lambda: 'return phase == "idle";'
@@ -2081,20 +2088,8 @@ va_client:
           - micro_wake_word.start:
           # Re-enable the SELECTED start word (no-op unless enrollment disabled it).
           - script.execute: apply_wake_word_selection
-    # Arm "stop" for the WHOLE reply AND through the follow-up listening window —
-    # not just while the backend says "replying". Two reasons:
-    #  1) The backend bursts the reply; the device keeps playing the audio TAIL
-    #     for a moment AFTER "idle", and the phase flaps replying<->thinking
-    #     mid-reply. So we arm on "replying" and never disarm on those flaps.
-    #  2) After every reply the device opens an automatic follow-up listening
-    #     window (mic on). The user must be able to say "stop" during that window
-    #     too. So we do NOT disarm on "idle" — that used to leave a dead gap over
-    #     the tail + the whole follow-up window (the reported "stop doesn't work
-    #     when it goes back to listening"). The disarm is handed to
-    #     followup_window_watchdog, which fires only once the device has truly
-    #     gone to rest (window expired, no new reply). A new reply cancels that
-    #     watchdog and re-arms. Mirrors stock's "arm while audio plays", extended
-    #     across our follow-up window.
+    # Arm stop while a reply is playing. Explicit follow-up listening re-arms it
+    # only when the firmware lifecycle confirms that its mic is actually open.
     - if:
         condition:
           lambda: 'return phase == "replying";'
@@ -2105,47 +2100,32 @@ va_client:
           # while keeping real reply-stops (0.52-0.67). Dropped to 0.40 in the
           # quiet follow-up/idle window below. (See the stop model comment.)
           - lambda: "id(stop).set_probability_cutoff(128);"
-          - script.stop: followup_window_watchdog
-    # A turn is in flight ("listening" = the server VAD heard the user speak,
-    # OR the follow-up window just opened its listening LED): stop the disarm
-    # watchdog that the preceding idle started. Without this it fires 12 s
-    # after that idle — mid-turn if the user is still talking — and its
-    # idle-or-listening condition matches, forcing phase/LED to idle and
-    # disarming "stop" in the middle of the conversation. Stopping it here
-    # also decouples the 12 s constant from follow_up_listen_seconds (windows
-    # > ~11 s no longer get cut short). Every path still converges on a
-    # disarm: each return to idle (incl. the window-expiry idle the firmware
-    # fires) restarts the watchdog. The request_follow_up path is unaffected —
-    # it sets the phase global directly (not via on_phase) and runs its own
-    # watchdog from on_followup_opened.
     - if:
         condition:
           lambda: 'return phase == "listening";'
         then:
-          - script.stop: followup_window_watchdog
+          - if:
+              condition:
+                lambda: "return id(va)->explicit_followup_active();"
+              then:
+                - micro_wake_word.enable_model: stop
+                - lambda: "id(stop).set_probability_cutoff(102);"
+              else:
+                - micro_wake_word.disable_model: stop
     - if:
         condition:
           lambda: 'return phase == "idle";'
         then:
-          - micro_wake_word.enable_model: stop
-          # B3: quiet at rest (no TTS) → restore the sensitive 0.40 (102) so weak
-          # real stops in the follow-up window are caught.
-          - lambda: "id(stop).set_probability_cutoff(102);"
-          - script.execute: followup_window_watchdog
+          - micro_wake_word.disable_model: stop
   on_repeated_failure:
     # Backend unreachable for N reconnect attempts. SILENT by design (was a
     # loud announcement — it fired at night and woke the household). The
     # no_ha_connection red twinkle is the sole indicator.
     - script.execute: control_leds
   on_followup_opened:
-    # Server's request_follow_up tool fired and va_client has waited
-    # for the TTS hardware tail to clear (kTtsTailMs ≈ 800 ms after the
-    # PSRAM ring drained). The mic is NOT yet open — we own the gating
-    # here, exactly like the wake-word handler. Play the chime, wait
-    # for it to actually finish through the speaker, then tell
-    # va_client to open the mic. This keeps the listening LED honest
-    # (it flips on at the same instant the mic does) and prevents the
-    # chime tail from leaking through the XMOS AEC into the server VAD.
+    # Firmware has verified the token/nonce, one-shot budget, REPLYING phase,
+    # and full reply drain. The mic is still closed. A delayed YAML callback
+    # must return the same token and nonce after the chime and echo guard.
     - if:
         condition:
           switch.is_on: wake_sound
@@ -2160,30 +2140,40 @@ va_client:
                   media_player.is_announcing:
                     id: external_media_player
               timeout: 2s
-          # i2s_audio_speaker ring tail + room-echo decay. The wake path gets
-          # away with 400 ms because the user speaks right after the chime and
-          # any leaked tail merges into their turn; here the user typically
-          # pauses ~1 s first, so a chime echo that survives the XMOS AEC
-          # (~10x leak) arrives ALONE — the server VAD calls it a turn, the
-          # silence after it commits, and the user's real answer then lands
-          # mid-response. 800 ms lets the echo decay before the mic opens.
-          # (Adopted from upstream maxmaxme 38be9c8, same reasoning verified.)
-          - delay: 800ms
-    - lambda: "id(va)->commit_followup_mic();"
-    - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
-    - script.execute: control_leds
-    # Arm the "stop" wake word so the user can abort if they changed
-    # their mind ("отмени"/"stop"). on_phase only enables stop during
-    # replying — during follow-up listening the server is silent until
-    # the user speaks, so we have to enable it ourselves.
-    - micro_wake_word.enable_model: stop
-    # B3: the follow-up window is quiet (the question's TTS + chime finished
-    # before the mic opens) → sensitive 0.40 (102) to catch weak stops.
-    - lambda: "id(stop).set_probability_cutoff(102);"
-    # If the user stays silent, va_client closes the mic at kRequestFollowUpMs
-    # but doesn't notify yaml — without this watchdog the LED would stay
-    # in listening_for_command forever and `stop` would never disarm.
-    - script.execute: followup_window_watchdog
+    # A timed-out chime wait leaves an announcement active and must fail closed. The
+    # delay is unconditional when no chime is configured, and starts only after
+    # a configured chime is confirmed complete.
+    - if:
+        condition:
+          and:
+            - switch.is_off: master_mute_switch
+            - not:
+                media_player.is_announcing:
+                  id: external_media_player
+        then:
+          # Let the speaker tail and room echo decay before opening the mic.
+          - delay: !lambda "return id(va)->get_followup_open_delay_ms();"
+          # Re-check after the asynchronous echo delay: mute, another
+          # announcement, local wake, stop, reconnect, or token revocation wins.
+          - if:
+              condition:
+                and:
+                  - switch.is_off: master_mute_switch
+                  - not:
+                      media_player.is_announcing:
+                        id: external_media_player
+              then:
+                - if:
+                    condition:
+                      lambda: "return id(va)->mark_followup_ready(token, session_nonce);"
+                    then:
+                      - logger.log:
+                          level: DEBUG
+                          format: "Follow-up READY sent; mic remains closed pending COMMIT"
+              else:
+                - lambda: "id(va)->abort_followup_mic(token, session_nonce);"
+        else:
+          - lambda: "id(va)->abort_followup_mic(token, session_nonce);"
 
 audio_dac:
   - platform: aic3204
@@ -2209,7 +2199,8 @@ micro_wake_word:
     # so the sensitivity select keeps working. To use a stock wake word instead:
     # https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json
     - model: ${wake_word_model}
-      id: alexa # primary (historical id kept — scripts reference it)
+      # Primary; scripts rely on the historical ID.
+      id: alexa
     - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/hey_jarvis.json
       id: wake_jarvis
     - model: https://github.com/OHF-Voice/micro-wake-word/releases/download/v2.1_models/okay_nabu.json
@@ -2244,6 +2235,7 @@ micro_wake_word:
   # follow-up window). Keep the gate (it still blocks non-speech noise
   # triggers for "alexa") but make it easier to satisfy.
   vad:
+    model: https://raw.githubusercontent.com/esphome/micro-wake-word-models/05b65922cc433c9df13e98e32a7fe520758c837e/models/v2/vad.json
     probability_cutoff: 0.3
   on_wake_word_detected:
     # Instant wake pulse — before any guards, exactly "the model fired".
@@ -2329,44 +2321,14 @@ micro_wake_word:
                             - lambda: "id(va)->send_interrupt();"
                             - speaker.stop:
                                 id: media_resampling_speaker
-                            # Play the same wake chime as fresh-session so the
-                            # user gets an audible cue that the mic actually
-                            # reopened — without it the device just silences
-                            # mid-reply and the user can't tell whether they
-                            # need to repeat themselves. Skipped when the
-                            # wake_sound switch is off.
-                            - if:
-                                condition:
-                                  switch.is_on: wake_sound
-                                then:
-                                  - script.execute:
-                                      id: play_sound
-                                      priority: true
-                                      sound_file: "wake_word_triggered_sound"
-                                  - wait_until:
-                                      condition:
-                                        not:
-                                          media_player.is_announcing:
-                                            id: external_media_player
-                                      timeout: 2s
-                                  # Downstream ring tail — keep the chime
-                                  # off the mic so XMOS AEC doesn't leak it
-                                  # back as "Ok, nabu" into the new turn.
-                                  # Tunable from the add-on (wake_open_delay_ms,
-                                  # default 700) via the hello handshake — the
-                                  # wake-path twin of follow_up_open_delay_ms.
-                                  # Was a hardcoded 400 ms; too short, the chime
-                                  # tail leaked in as a ghost turn (2026-06-12).
-                                  - delay: !lambda "return id(va)->get_wake_open_delay_ms();"
-                            # Open the mic locally. Used to rely on the
-                            # bridge echoing phase=listening after interrupt;
-                            # bridge no longer does that (it would also pop
-                            # the mic open after a Stop), so we drive it
-                            # explicitly here. start_session() is idempotent
-                            # against the send_interrupt() above.
-                            - lambda: "id(va)->start_session();"
-                            - lambda: id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};
-                            - script.execute: control_leds
+                            - script.execute:
+                                id: guarded_wake_start
+                                wake_reservation: !lambda |-
+                                  return id(va)->prepare_local_wake();
+                                listening_phase: true
+                                play_chime: !lambda |-
+                                  return id(wake_sound).state;
+                                sound_file: "wake_word_triggered_sound"
                           else:
                             # Backend down? Don't pretend to listen. Without
                             # this guard we'd play the wake chime + start
@@ -2388,47 +2350,21 @@ micro_wake_word:
                                   # Regular wake word: play wake chime, start a new session.
                                   # Stop the TTS playback chain first. The previous turn may
                                   # still have downstream ring residual (~600 ms) even after
-                                  # the server said phase=idle — start_session()'s internal
-                                  # send_interrupt() flushes the PSRAM queue, but the leaf's
+                                  # the server said phase=idle — prepare_local_wake() flushes
+                                  # the PSRAM queue, but the leaf's
                                   # own ring buffers it can't reach. Without this stop the
                                   # tail of the old reply leaks under the wake chime.
                                   # No-op when there's nothing playing.
                                   - speaker.stop:
                                       id: media_resampling_speaker
-                                  - if:
-                                      condition:
-                                        switch.is_on: wake_sound
-                                      then:
-                                        - script.execute:
-                                            id: play_sound
-                                            priority: true
-                                            sound_file: "wake_word_triggered_sound"
-                                        # Wait until the chime has actually finished
-                                        # playing through the speaker — a fixed 300ms
-                                        # delay was racing with the ~500ms FLAC and the
-                                        # mic was streaming the chime tail to OpenAI
-                                        # (which transcribed it as "Ok, nabu").
-                                        - wait_until:
-                                            condition:
-                                              not:
-                                                media_player.is_announcing:
-                                                  id: external_media_player
-                                            timeout: 2s
-                                        # Downstream i2s_audio_speaker ring buffer is
-                                        # still draining. Tunable from the add-on
-                                        # (wake_open_delay_ms, default 700) via the
-                                        # hello handshake — the wake-path twin of
-                                        # follow_up_open_delay_ms. Was a hardcoded
-                                        # 400 ms, which let the chime tail leak into
-                                        # the fresh mic as a ghost turn (2026-06-12).
-                                        - delay: !lambda "return id(va)->get_wake_open_delay_ms();"
-                                  - lambda: "id(va)->start_session();"
-                                  # Show "waiting for command" (blue spin) immediately on wake,
-                                  # before the server VAD detects actual speech. va_client's
-                                  # on_phase will overwrite to phase 3 (listening_for_command)
-                                  # once the server reports speech started.
-                                  - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
-                                  - script.execute: control_leds
+                                  - script.execute:
+                                      id: guarded_wake_start
+                                      wake_reservation: !lambda |-
+                                        return id(va)->prepare_local_wake();
+                                      listening_phase: false
+                                      play_chime: !lambda |-
+                                        return id(wake_sound).state;
+                                      sound_file: "wake_word_triggered_sound"
 
 select:
   - platform: template

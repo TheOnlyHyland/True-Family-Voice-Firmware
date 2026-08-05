@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+while read -r expected url; do
+  case "$expected" in
+    ""|'#'*) continue ;;
+  esac
+  actual=$(curl -fsSL --retry 3 "$url" | sha256sum)
+  actual=${actual%% *}
+  if [ "$actual" != "$expected" ]; then
+    printf '%s\n' "external input checksum mismatch: $url" >&2
+    exit 1
+  fi
+done < "$ROOT/external-inputs.lock"
+
+printf '%s\n' "Verified immutable external input checksums."

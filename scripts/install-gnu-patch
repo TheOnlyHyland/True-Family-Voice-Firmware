@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+DESTINATION=${1:?usage: install-gnu-patch DESTINATION}
+URL=https://ftp.gnu.org/gnu/patch/patch-2.7.6.tar.xz
+
+if [ -e "$DESTINATION" ]; then
+  printf '%s\n' "refusing to replace existing GNU patch destination: $DESTINATION" >&2
+  exit 1
+fi
+
+EXPECTED=$(awk -v url="$URL" '$2 == url { print $1 }' "$ROOT/external-inputs.lock")
+if [ "${#EXPECTED}" -ne 64 ]; then
+  printf '%s\n' "GNU patch archive is not uniquely locked" >&2
+  exit 1
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "$URL" -o "$TMP/patch.tar.xz"
+printf '%s  %s\n' "$EXPECTED" "$TMP/patch.tar.xz" | sha256sum -c -
+tar -xJf "$TMP/patch.tar.xz" -C "$TMP"
+
+(
+  cd "$TMP/patch-2.7.6"
+  ./configure --prefix="$TMP/install"
+  make -j2
+  make install
+)
+
+"$TMP/install/bin/patch" --version | grep -m1 -Fxq "GNU patch 2.7.6"
+mv "$TMP/install" "$DESTINATION"
+printf '%s\n' "$DESTINATION/bin"

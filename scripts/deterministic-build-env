@@ -1,0 +1,23 @@
+# This file is sourced by release build and packaging scripts after ROOT is set.
+
+EPOCH_FILE="$ROOT/SOURCE_DATE_EPOCH"
+if [ ! -f "$EPOCH_FILE" ] || [ "$(wc -l < "$EPOCH_FILE")" -ne 1 ] || \
+  ! grep -Exq '[1-9][0-9]*' "$EPOCH_FILE"; then
+  printf '%s\n' "SOURCE_DATE_EPOCH must contain one canonical positive integer" >&2
+  exit 1
+fi
+
+EXPECTED_SOURCE_DATE_EPOCH=$(tr -d '\n' < "$EPOCH_FILE")
+if [ "${SOURCE_DATE_EPOCH+x}" = x ] && \
+  [ "$SOURCE_DATE_EPOCH" != "$EXPECTED_SOURCE_DATE_EPOCH" ]; then
+  printf '%s\n' \
+    "SOURCE_DATE_EPOCH differs from the version-controlled release epoch" >&2
+  exit 1
+fi
+
+SOURCE_DATE_EPOCH=$EXPECTED_SOURCE_DATE_EPOCH
+TZ=UTC0
+LANG=C
+LC_ALL=C
+PYTHONHASHSEED=0
+export LANG LC_ALL PYTHONHASHSEED SOURCE_DATE_EPOCH TZ

@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+VERSION=$(tr -d '\r\n' < "$ROOT/VERSION")
+
+case "$VERSION" in
+  ''|*[!0-9.]*|.*|*..*|*.)
+    printf '%s\n' "invalid VERSION: $VERSION" >&2
+    exit 1
+    ;;
+esac
+
+if ! grep -Fq "version: \"$VERSION\"" "$ROOT/home-assistant-voice.realtime.yaml"; then
+  printf '%s\n' "embedded project version does not match VERSION" >&2
+  exit 1
+fi
+if ! grep -Fq "@$VERSION" "$ROOT/home-assistant-voice.realtime.yaml"; then
+  printf '%s\n' "published va_client source does not match VERSION" >&2
+  exit 1
+fi
+if ! grep -Fq "firmware_version: \"$VERSION\"" "$ROOT/home-assistant-voice.realtime.factory.yaml"; then
+  printf '%s\n' "factory version marker does not match VERSION" >&2
+  exit 1
+fi
+for stub in esphome-builder.dhcp.yaml esphome-builder.static-ip.yaml; do
+  if ! grep -Fq "ref: \"$VERSION\"" "$ROOT/$stub" ||
+     ! grep -Fq "@$VERSION" "$ROOT/$stub"; then
+    printf '%s\n' "$stub does not use the immutable release version" >&2
+    exit 1
+  fi
+done
+
+if [ "$#" -gt 1 ]; then
+  printf '%s\n' "usage: $0 [RELEASE_TAG]" >&2
+  exit 2
+fi
+if [ "$#" -eq 1 ] && [ "$1" != "$VERSION" ]; then
+  printf '%s\n' "release tag $1 does not equal embedded firmware $VERSION" >&2
+  exit 1
+fi
+
+printf '%s\n' "$VERSION"

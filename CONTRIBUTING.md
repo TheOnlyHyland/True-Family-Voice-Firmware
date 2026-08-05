@@ -1,7 +1,7 @@
 # Contributing
 
-Same rules as the main repo — read
-[voicepe-realtime/CONTRIBUTING.md](https://github.com/TristanBrotherton/voicepe-realtime/blob/main/CONTRIBUTING.md).
+Changes and review happen in
+[True-Family-Voice-Firmware](https://github.com/TheOnlyHyland/True-Family-Voice-Firmware).
 
 Firmware-specific bar:
 
@@ -12,3 +12,12 @@ Firmware-specific bar:
   device will be redirected there.
 - Substitutions are the public API of this package: renaming or removing one
   breaks every user's device stub. Add, don't rename.
+- Run `./scripts/verify` for host tests. Firmware changes must also pass
+  `./scripts/verify --compile`, which builds the deployable Realtime YAML from
+  the checked-out local component rather than the currently published tag. The
+  host gate includes checksum-locked Actionlint; CI also runs hash-locked strict
+   yamllint. The compile gate requires checksum-built GNU patch `2.7.6`, verifies
+   the exact ESP-IDF component-manager and Improv closures, and remains protected
+   by the process-wide compile lock. Local and protected release builds use the
+   same version-controlled `SOURCE_DATE_EPOCH` and fail-closed ESPHome `2026.7.3`
+   source patch.

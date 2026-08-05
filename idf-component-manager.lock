@@ -1,0 +1,10 @@
+# Exact normalized ESP-IDF component-manager closure for the release target.
+# The verifier normalizes only the workspace-local Improv path, registry URL
+# trailing slashes, and component-manager's derived manifest hash.
+schema=1
+target=esp32s3
+idf=5.5.5
+normalized_sha256=7c116bf6f1f44462c4391a1afe4c16c77cc383cb2f8d16b840c2e7bcf3f08f42
+improv_version=1.2.4
+improv_file_count=12
+improv_tree_sha256=48b0074c1a1362bcc680d474cbfcc55ff5eb2ddccf77da504dcfb71795052faa

@@ -1,0 +1,279 @@
+name: Publish Firmware Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      preparation_run_id:
+        description: "Successful Prepare Firmware Release run ID"
+        required: true
+        type: string
+      artifact_id:
+        description: "Exact immutable artifact ID reported by preparation"
+        required: true
+        type: string
+      artifact_digest:
+        description: "Exact lowercase artifact SHA-256 reported by preparation"
+        required: true
+        type: string
+      source_commit:
+        description: "Exact source commit bound into the artifact"
+        required: true
+        type: string
+      version:
+        description: "Exact version and tag bound into the artifact"
+        required: true
+        type: string
+      prerelease:
+        description: "Must match the prepared release intent"
+        required: true
+        default: true
+        type: boolean
+      confirm_publish:
+        description: "Publish this exact prepared package without rebuilding"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-firmware-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: ${{ inputs.confirm_publish }}
+    name: Verify and Publish Exact Prepared Bytes
+    runs-on: ubuntu-24.04
+    environment:
+      name: firmware-release
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      source_commit: ${{ steps.published.outputs.source_commit }}
+      version: ${{ steps.published.outputs.version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ARTIFACT_DIGEST: ${{ inputs.artifact_digest }}
+      ARTIFACT_ID: ${{ inputs.artifact_id }}
+      PREPARATION_RUN_ID: ${{ inputs.preparation_run_id }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Validate explicit publication inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "TheOnlyHyland/True-Family-Voice-Firmware"
+          [[ "$PREPARATION_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)(\.(0|[1-9][0-9]*))?)?$ ]]
+          test "$PRERELEASE" = "true" || test "$PRERELEASE" = "false"
+      - name: Require one successful protected preparation artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREPARATION_RUN_ID")
+          test "$(jq -r '.event' <<< "$run_json")" = "workflow_dispatch"
+          test "$(jq -r '.conclusion' <<< "$run_json")" = "success"
+          test "$(jq -r '.path' <<< "$run_json")" = ".github/workflows/prepare-release.yml"
+
+          artifacts_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PREPARATION_RUN_ID/artifacts?per_page=100")
+          test "$(jq -r '.total_count' <<< "$artifacts_json")" = "1"
+          test "$(jq -r '.artifacts[0].id' <<< "$artifacts_json")" = "$ARTIFACT_ID"
+
+          artifact_json=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID")
+          test "$(jq -r '.name' <<< "$artifact_json")" = "firmware-release-package"
+          test "$(jq -r '.expired' <<< "$artifact_json")" = "false"
+          test "$(jq -r '.workflow_run.id' <<< "$artifact_json")" = "$PREPARATION_RUN_ID"
+          test "$(jq -r '.digest' <<< "$artifact_json")" = "sha256:$ARTIFACT_DIGEST"
+      - name: Check out exact prepared source
+        # actions/checkout v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact source and unused tag intent
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          sh ./scripts/verify-version "$VERSION"
+          grep -Fq "@${VERSION}" home-assistant-voice.realtime.yaml
+          source_tree=$(git rev-parse 'HEAD^{tree}')
+          [[ "$source_tree" =~ ^[0-9a-f]{40}$ ]]
+          printf 'source_tree=%s\n' "$source_tree" >> "$GITHUB_OUTPUT"
+      - name: Download exact immutable artifact by ID and run
+        # actions/download-artifact v4.3.0
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.preparation_run_id }}
+          path: prepared-release
+      - name: Verify source, version, intent, and every package hash
+        env:
+          SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
+        run: >-
+          python3 ./scripts/verify-release-intent.py "$VERSION"
+          "$SOURCE_COMMIT" "$SOURCE_TREE" "$PRERELEASE" prepared-release
+      - name: Refuse any existing tag, release, asset, or R2 object
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          : "${AWS_ACCESS_KEY_ID:?firmware-release R2 access key is required}"
+          : "${AWS_SECRET_ACCESS_KEY:?firmware-release R2 secret is required}"
+          : "${R2_ACCOUNT_ID:?firmware-release R2 account is required}"
+          : "${R2_BUCKET:?firmware-release R2 bucket is required}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
+            printf 'refusing to reuse existing tag: %s\n' "$VERSION" >&2
+            exit 1
+          fi
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            printf 'refusing to reuse existing GitHub release: %s\n' "$VERSION" >&2
+            exit 1
+          fi
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          prefix="${GITHUB_REPOSITORY#*/}/home-assistant-voice/$VERSION/"
+          existing=$(aws s3api list-objects-v2 \
+            --endpoint-url "$endpoint" \
+            --bucket "$R2_BUCKET" \
+            --prefix "$prefix" \
+            --query 'length(Contents || `[]`)' \
+            --output text)
+          test "$existing" = "0"
+      - name: Create exact tag and private draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes=$(mktemp)
+          printf '%s\n\n' "Immutable True Family Voice Realtime firmware $VERSION." > "$notes"
+          printf '%s\n' "Built and verified before publication from exact commit $SOURCE_COMMIT." >> "$notes"
+          args=(
+            "$VERSION"
+            --target "$SOURCE_COMMIT"
+            --title "True Family Voice Realtime $VERSION"
+            --notes-file "$notes"
+            --draft
+          )
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}"
+          draft=$(gh release view "$VERSION" --json isDraft,isPrerelease,tagName)
+          test "$(jq -r '.isDraft' <<< "$draft")" = "true"
+          test "$(jq -r '.isPrerelease' <<< "$draft")" = "$PRERELEASE"
+          test "$(jq -r '.tagName' <<< "$draft")" = "$VERSION"
+          git fetch origin "refs/tags/$VERSION:refs/tags/$VERSION"
+          test "$(git rev-list -n 1 "$VERSION")" = "$SOURCE_COMMIT"
+      - name: Upload draft assets without clobber and verify readback
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="prepared-release/package/$VERSION"
+          files=(
+            true-family-voice-esp32s3.factory.bin
+            true-family-voice-esp32s3.ota.bin
+            true-family-voice-esp32s3.elf
+            SHA256SUMS
+            manifest.json
+          )
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$VERSION" --jq '.assets[].name')
+          test -z "$existing"
+          for file in "${files[@]}"; do
+            gh release upload "$VERSION" "$package/$file"
+          done
+          mkdir github-readback
+          for file in "${files[@]}"; do
+            gh release download "$VERSION" --dir github-readback --pattern "$file"
+            cmp "$package/$file" "github-readback/$file"
+          done
+          python3 ./scripts/verify-release-package.py "$VERSION" github-readback
+      - name: Publish exact versioned R2 bytes without clobber and verify readback
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          prefix="${GITHUB_REPOSITORY#*/}/home-assistant-voice/$VERSION"
+          package="prepared-release/package/$VERSION"
+          files=(
+            true-family-voice-esp32s3.factory.bin
+            true-family-voice-esp32s3.ota.bin
+            true-family-voice-esp32s3.elf
+            SHA256SUMS
+            manifest.json
+          )
+          for file in "${files[@]}"; do
+            case "$file" in
+              *.json) content_type=application/json ;;
+              SHA256SUMS) content_type=text/plain ;;
+              *) content_type=application/octet-stream ;;
+            esac
+            content_md5=$(openssl dgst -md5 -binary "$package/$file" | base64 --wrap=0)
+            aws s3api put-object \
+              --endpoint-url "$endpoint" \
+              --bucket "$R2_BUCKET" \
+              --key "$prefix/$file" \
+              --body "$package/$file" \
+              --content-md5 "$content_md5" \
+              --content-type "$content_type" \
+              --cache-control "public,max-age=31536000,immutable" \
+              --if-none-match "*" >/dev/null
+          done
+          mkdir r2-readback
+          for file in "${files[@]}"; do
+            aws s3api get-object \
+              --endpoint-url "$endpoint" \
+              --bucket "$R2_BUCKET" \
+              --key "$prefix/$file" \
+              "r2-readback/$file" >/dev/null
+            cmp "$package/$file" "r2-readback/$file"
+          done
+          python3 ./scripts/verify-release-package.py "$VERSION" r2-readback
+      - name: Make verified draft public as the final publication operation
+        id: published
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$VERSION" --draft=false
+          published=$(gh release view "$VERSION" --json isDraft,isPrerelease,tagName)
+          test "$(jq -r '.isDraft' <<< "$published")" = "false"
+          test "$(jq -r '.isPrerelease' <<< "$published")" = "$PRERELEASE"
+          test "$(jq -r '.tagName' <<< "$published")" = "$VERSION"
+          printf 'source_commit=%s\n' "$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+
+  pages:
+    name: Advertise Only After Publication Succeeds
+    needs:
+      - publish
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/gh-pages.yml
+    with:
+      source_commit: ${{ needs.publish.outputs.source_commit }}
+      version: ${{ needs.publish.outputs.version }}

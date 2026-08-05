@@ -1,36 +1,154 @@
-name: Update latest build
+name: Promote Published Firmware
 
 on:
-  release:
-    types: [edited]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact published version to promote"
+        required: true
+        type: string
+      channel:
+        description: "Protected channel to update"
+        required: true
+        type: choice
+        options:
+          - beta
+          - production
+      confirm_promotion:
+        description: "Promote only this published immutable package"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-firmware-${{ inputs.channel }}
+  cancel-in-progress: false
 
 jobs:
-  update-latest:
-    name: Update latest build version
-    runs-on: ubuntu-latest
-    environment: production
-    if: ${{ !contains(github.event.release.tag_name, 'beta') && github.event.changes.make_latest && github.event.changes.make_latest.to == 'true' }}
-    strategy:
-      matrix:
-        device:
-          - home-assistant-voice
-          - ha-voice-8mb
+  approve-channel:
+    if: ${{ inputs.confirm_promotion }}
+    name: Approve Channel Change
+    runs-on: ubuntu-24.04
+    environment:
+      name: firmware-${{ inputs.channel }}
     steps:
-      - name: Download version manifest from R2
-        run: curl -o manifest.json https://firmware.esphome.io/home-assistant-voice-pe/${{ matrix.device }}/${{ github.event.release.tag_name }}/manifest.json
-      - name: Update paths
-        run: |
-          mkdir output
-          version="${{ github.event.release.tag_name }}"
-          jq --arg version "$version" \
-              '.builds[].ota.path |= $version + "/" + . | (.builds[].parts // [])[].path |= $version + "/" + .' \
-              manifest.json > output/manifest.json
-      - name: Upload updated manifest to R2
-        uses: ryand56/r2-upload-action@b801a390acbdeb034c5e684ff5e1361c06639e7c  # v1.4
+      - name: Record protected channel approval
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          VERSION: ${{ inputs.version }}
+        run: printf 'Approved %s promotion of %s.\n' "$CHANNEL" "$VERSION"
+
+  promote:
+    name: Promote Published Versioned Bytes
+    runs-on: ubuntu-24.04
+    needs:
+      - approve-channel
+    environment:
+      name: firmware-release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CHANNEL: ${{ inputs.channel }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Check out exact published tag
+        # actions/checkout v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          r2-account-id: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
-          r2-access-key-id: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
-          r2-secret-access-key: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
-          r2-bucket: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
-          source-dir: output
-          destination-dir: home-assistant-voice-pe/${{ matrix.device }}/
+          ref: ${{ inputs.version }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require exact public release and channel class
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "TheOnlyHyland/True-Family-Voice-Firmware"
+          sh ./scripts/verify-version "$VERSION"
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$VERSION")"
+          grep -Fq "@${VERSION}" home-assistant-voice.realtime.yaml
+          release=$(gh release view "$VERSION" --json isDraft,isPrerelease,tagName)
+          test "$(jq -r '.isDraft' <<< "$release")" = "false"
+          test "$(jq -r '.tagName' <<< "$release")" = "$VERSION"
+          if [ "$CHANNEL" = "beta" ]; then
+            test "$(jq -r '.isPrerelease' <<< "$release")" = "true"
+          else
+            test "$(jq -r '.isPrerelease' <<< "$release")" = "false"
+          fi
+      - name: Download exact published GitHub package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir package
+          for file in \
+            true-family-voice-esp32s3.factory.bin \
+            true-family-voice-esp32s3.ota.bin \
+            true-family-voice-esp32s3.elf \
+            SHA256SUMS \
+            manifest.json; do
+            gh release download "$VERSION" --dir package --pattern "$file"
+          done
+          python3 ./scripts/verify-release-package.py "$VERSION" package
+      - name: Require published versioned R2 byte equality
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          : "${AWS_ACCESS_KEY_ID:?firmware-release R2 access key is required}"
+          : "${AWS_SECRET_ACCESS_KEY:?firmware-release R2 secret is required}"
+          : "${R2_ACCOUNT_ID:?firmware-release R2 account is required}"
+          : "${R2_BUCKET:?firmware-release R2 bucket is required}"
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          prefix="${GITHUB_REPOSITORY#*/}/home-assistant-voice/$VERSION"
+          mkdir r2-package
+          for file in package/*; do
+            name=${file##*/}
+            aws s3api get-object \
+              --endpoint-url "$endpoint" \
+              --bucket "$R2_BUCKET" \
+              --key "$prefix/$name" \
+              "r2-package/$name" >/dev/null
+            cmp "$file" "r2-package/$name"
+          done
+          python3 ./scripts/verify-release-package.py "$VERSION" r2-package
+      - name: Promote manifest derived from published bytes without rebuilding
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          if [ "$CHANNEL" = "beta" ]; then
+            manifest=manifest-beta.json
+          else
+            manifest=manifest.json
+          fi
+          key="${GITHUB_REPOSITORY#*/}/home-assistant-voice/$manifest"
+          ./scripts/make-channel-manifest "$VERSION" package "$manifest"
+          content_md5=$(openssl dgst -md5 -binary "$manifest" | base64 --wrap=0)
+          aws s3api put-object \
+            --endpoint-url "$endpoint" \
+            --bucket "$R2_BUCKET" \
+            --key "$key" \
+            --body "$manifest" \
+            --content-md5 "$content_md5" \
+            --content-type application/json \
+            --cache-control "no-cache" >/dev/null
+          aws s3api get-object \
+            --endpoint-url "$endpoint" \
+            --bucket "$R2_BUCKET" \
+            --key "$key" \
+            promoted-manifest.json >/dev/null
+          cmp "$manifest" promoted-manifest.json

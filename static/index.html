@@ -1,9 +1,9 @@
 <html>
   <head>
-    <title>Home Assistant Voice PE</title>
+    <title>True Family Voice Realtime</title>
     <meta
       name="description"
-      content="Install firmware on Home Assistant Voice PE."
+      content="Install True Family Voice Realtime firmware."
     />
     <style>
       /* Basic styling for the details element */
@@ -50,13 +50,13 @@
 
   <body>
     <div>
-      <h1>Install Voice PE Latest Firmware</h1>
+      <h1>Install True Family Voice Realtime</h1>
       <p>
         Connect your Home Assistant Voice to your computer and click on connect
         below.
       </p>
       <esp-web-install-button
-        manifest="https://firmware.esphome.io/home-assistant-voice-pe/home-assistant-voice/manifest.json"
+        manifest="https://firmware.esphome.io/True-Family-Voice-Firmware/home-assistant-voice/manifest.json"
       >
       </esp-web-install-button>
     </div>
@@ -64,40 +64,12 @@
     <details>
       <summary>Install Specific Version</summary>
       Select a Release: <select id="releases"></select><br />
-      <div class="link"></div>
+      <div class="link"><a id="version-link" hidden></a></div>
     </details>
-    <script>
-      function selectVersion(version) {
-        select = document.getElementById("releases")
-        const option = Array.from(select.options).find(option => option.value === version);
-        select.selectedIndex = option ? option.index : 0;
-      }
-	    
-      function setVersion(version) {
-        document.querySelector("h1").innerHTML = `Install Voice PE v${version}`;
-        document.querySelector(
-          "esp-web-install-button",
-        ).manifest = `https://firmware.esphome.io/home-assistant-voice-pe/home-assistant-voice/${version}/manifest.json`;
-        document.querySelector(
-          ".link",
-        ).innerHTML = `<a href="?version=${version}">Link to v${version}</a>`;
-      }
-	  
-      document.querySelector("#releases").addEventListener("change", (ev) => {
-        const version = ev.target.value;
-        setVersion(version);
-      });
-
-      var urlParams = new URLSearchParams(window.location.search);
-      if (urlParams.has("version")) {
-        const version = urlParams.get("version");
-        setVersion(version);
-        selectVersion(version);
-      }
-    </script>
+    <script type="module" src="./installer.mjs"></script>
+    <script
+      type="module"
+      src="./vendor/esp-web-tools/install-button.js"
+    ></script>
   </body>
-  <script
-    type="module"
-    src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"
-  ></script>
 </html>

@@ -1,0 +1,68 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  printf '%s\n' "usage: $0 DESTINATION" >&2
+  exit 2
+fi
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+DEST=$1
+URL=https://registry.npmjs.org/esp-web-tools/-/esp-web-tools-10.0.1.tgz
+EXPECTED=$(while read -r checksum source; do
+  if [ "$source" = "$URL" ]; then
+    printf '%s\n' "$checksum"
+  fi
+done < "$ROOT/external-inputs.lock")
+
+if [ -z "$EXPECTED" ]; then
+  printf '%s\n' "installer dependency is absent from external-inputs.lock" >&2
+  exit 1
+fi
+if [ -e "$DEST" ]; then
+  printf '%s\n' "refusing to replace installer vendor directory: $DEST" >&2
+  exit 1
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+ARCHIVE=$TMP/esp-web-tools.tgz
+curl -fsSL --retry 3 "$URL" -o "$ARCHIVE"
+ACTUAL=$(sha256sum "$ARCHIVE")
+ACTUAL=${ACTUAL%% *}
+if [ "$ACTUAL" != "$EXPECTED" ]; then
+  printf '%s\n' "installer dependency checksum mismatch" >&2
+  exit 1
+fi
+
+mkdir -p "$DEST"
+tar -xzf "$ARCHIVE" -C "$DEST" --strip-components=3 package/dist/web
+tar -xOf "$ARCHIVE" package/LICENSE > "$DEST/LICENSE"
+
+for file in \
+  esp32-D9Bry5AK.js \
+  esp32c2-C0aHw_np.js \
+  esp32c3-1QKN64_Z.js \
+  esp32c6-CgjBrh_Q.js \
+  esp32h2-Bm3EZXXU.js \
+  esp32s2-DxMNCsFV.js \
+  esp32s3-DkYcGTTD.js \
+  esp8266-DEFNY3lv.js \
+  index-BbuTar3J.js \
+  install-button.js \
+  install-dialog-BWZCBYvU.js \
+  rom-B2LvkjpK.js \
+  styles-ChWDJ3ue.js; do
+  if [ ! -f "$DEST/$file" ]; then
+    printf '%s\n' "installer dependency member is missing: $file" >&2
+    exit 1
+  fi
+done
+
+set -- "$DEST"/*.js
+if [ "$#" -ne 13 ]; then
+  printf '%s\n' "installer dependency contains an unexpected JavaScript file set" >&2
+  exit 1
+fi
+
+printf '%s\n' "Staged checksum-locked esp-web-tools 10.0.1 in $DEST"

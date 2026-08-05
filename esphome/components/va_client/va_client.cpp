@@ -10,11 +10,44 @@
 #include <esp_websocket_client.h>
 #include <esp_event.h>
 #include <esp_heap_caps.h>
+#include <esp_random.h>
 
 namespace esphome {
 namespace va_client {
 
 static const char *const TAG = "va_client";
+
+bool VaClient::send_text_bounded_(const std::string &message, const char *label) {
+  if (!this->ws_connected_ || this->ws_handle_ == nullptr || message.empty()) {
+    ESP_LOGW(TAG, "%s not sent: websocket unavailable", label);
+    return false;
+  }
+  const uint32_t connection_generation = this->ws_connection_generation_.load();
+  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+  const int sent = esp_websocket_client_send_text(
+      handle, message.data(), static_cast<int>(message.size()),
+      pdMS_TO_TICKS(kControlSendTimeoutMs));
+  const bool exact = sent == static_cast<int>(message.size()) &&
+                     this->ws_connected_.load() &&
+                     this->ws_connection_generation_.load() == connection_generation;
+  if (!exact) {
+    ESP_LOGW(TAG, "%s send failed or partial (%d/%u bytes)", label, sent,
+             (unsigned) message.size());
+  }
+  return exact;
+}
+
+bool VaClient::send_binary_bounded_(const uint8_t *data, size_t len) {
+  if (!this->ws_connected_ || this->ws_handle_ == nullptr || data == nullptr || len == 0)
+    return false;
+  const uint32_t connection_generation = this->ws_connection_generation_.load();
+  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+  const int sent = esp_websocket_client_send_bin(
+      handle, reinterpret_cast<const char *>(data), static_cast<int>(len),
+      pdMS_TO_TICKS(kAudioSendTimeoutMs));
+  return sent == static_cast<int>(len) && this->ws_connected_.load() &&
+         this->ws_connection_generation_.load() == connection_generation;
+}
 
 // Free-function trampoline. esp-idf event registration takes a C function
 // pointer; we recover the VaClient* from the user_data slot.
@@ -23,28 +56,6 @@ static void va_ws_event_handler(void *handler_args, esp_event_base_t /*base*/, i
   if (self == nullptr)
     return;
   self->on_ws_event(event_id, event_data);
-}
-
-// Parse the unsigned integer immediately following `key` in `msg` (key includes
-// the quotes + colon, e.g. "\"follow_up_ms\":"). Returns true and sets `out` if a
-// run of digits was found right after the key. Keeps us out of a JSON parser for
-// the few small ints the backend sends in `hello`.
-static bool parse_uint_after_key(const std::string &msg, const char *key, uint32_t &out) {
-  size_t p = msg.find(key);
-  if (p == std::string::npos)
-    return false;
-  p += std::strlen(key);
-  uint32_t v = 0;
-  bool any = false;
-  while (p < msg.size() && msg[p] >= '0' && msg[p] <= '9') {
-    v = v * 10u + static_cast<uint32_t>(msg[p] - '0');
-    p++;
-    any = true;
-  }
-  if (!any)
-    return false;
-  out = v;
-  return true;
 }
 
 void VaClient::setup() {
@@ -65,6 +76,12 @@ void VaClient::setup() {
     ESP_LOGE(TAG, "Failed to allocate %u-byte audio buffer in PSRAM", (unsigned) kAudioBufBytes);
   } else {
     ESP_LOGCONFIG(TAG, "Allocated %u-byte audio ring buffer in PSRAM", (unsigned) kAudioBufBytes);
+  }
+  this->audio_drain_buf_ = static_cast<uint8_t *>(
+      heap_caps_malloc(kAudioDrainChunkBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (this->audio_drain_buf_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate %u-byte audio drain buffer in PSRAM",
+             (unsigned) kAudioDrainChunkBytes);
   }
 
   // Allocate the mic pre-roll ring in PSRAM (kPreRollMs of 16 kHz int16 mono).
@@ -95,9 +112,11 @@ void VaClient::setup() {
 }
 
 void VaClient::loop() {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
   // Drain the audio ring buffer into the speaker. speaker.play() accepts
   // only what fits in its own ring (returns the count actually queued).
-  if (this->speaker_ != nullptr && this->audio_buf_ != nullptr) {
+  if (this->speaker_ != nullptr && this->audio_buf_ != nullptr &&
+      this->audio_drain_buf_ != nullptr) {
     // Snapshot ring state under the lock — head/tail/fill are all
     // mutated from the WS task on the other core.
     portENTER_CRITICAL(&this->ring_mux_);
@@ -204,26 +223,47 @@ void VaClient::loop() {
                  (unsigned) fill);
         this->underrun_logged_this_turn_ = true;
       }
-      // Contiguous slice we can hand to play() without copying: from head
-      // to either the end of the buffer or the tail.
-      size_t contiguous = (head < tail) ? (tail - head) : (kAudioBufBytes - head);
-      if (contiguous > fill)
-        contiguous = fill;
-      // play() runs OUTSIDE the critical section: it can take milliseconds
-      // (resampler ring may be full, mixer blocks). Holding ring_mux_
-      // across it would block the writer and cause audio underrun.
-      size_t accepted = this->speaker_->play(this->audio_buf_ + head, contiguous);
+      // Copy a bounded, generation-checked slice while holding the ring lock.
+      // play() can block, so it consumes the private scratch copy outside the
+      // lock while the websocket producer remains free to append or reset.
+      size_t contiguous = 0;
+      portENTER_CRITICAL(&this->ring_mux_);
+      if (this->prebuffer_generation_ == prebuffer_generation &&
+          this->audio_head_ == head && this->audio_fill_ > 0) {
+        tail = this->audio_tail_;
+        fill = this->audio_fill_;
+        contiguous = (head < tail) ? (tail - head) : (kAudioBufBytes - head);
+        contiguous = std::min(contiguous, fill);
+        contiguous = std::min(contiguous, kAudioDrainChunkBytes);
+        std::memcpy(this->audio_drain_buf_, this->audio_buf_ + head, contiguous);
+      }
+      portEXIT_CRITICAL(&this->ring_mux_);
+      if (contiguous == 0)
+        return;
+      size_t accepted = this->speaker_->play(this->audio_drain_buf_, contiguous);
       if (accepted > 0) {
         this->last_fed_ms_ = millis();  // keep the chain "warm" for cold-detection
+        bool committed = false;
+        size_t remaining = 0;
         portENTER_CRITICAL(&this->ring_mux_);
-        this->audio_head_ = (this->audio_head_ + accepted) % kAudioBufBytes;
-        this->audio_fill_ -= accepted;
+        // An interrupt can reset the ring while play() runs outside the lock.
+        // Commit this read only if it still belongs to the exact snapshot;
+        // otherwise subtracting from the reset fill would underflow size_t.
+        if (this->prebuffer_generation_ == prebuffer_generation &&
+            this->audio_head_ == head && this->audio_fill_ >= accepted) {
+          this->audio_head_ = (this->audio_head_ + accepted) % kAudioBufBytes;
+          this->audio_fill_ -= accepted;
+          remaining = this->audio_fill_;
+          committed = true;
+        }
         portEXIT_CRITICAL(&this->ring_mux_);
+        if (!committed)
+          return;
         static uint32_t dbg_last = 0;
         uint32_t now = millis();
         if (now - dbg_last >= 500) {
           ESP_LOGD(TAG, "drained %u bytes (%u still queued)", (unsigned) accepted,
-                   (unsigned) (fill - accepted));
+                    (unsigned) remaining);
           dbg_last = now;
         }
       }
@@ -244,7 +284,7 @@ void VaClient::loop() {
   // Fallback: kSpeakerStopTimeoutMs (3 s). If something wedges and the
   // speaker never reports STOPPED, we still progress so the LED doesn't
   // lock in `replying`.
-  if (this->followup_pending_ && this->audio_fill_ == 0 &&
+  if (this->followup_pending_ && this->audio_fill_snapshot_() == 0 &&
       !this->waiting_for_speaker_stop_) {
     this->waiting_for_speaker_stop_ = true;
     this->speaker_stop_wait_started_ms_ = millis();
@@ -268,6 +308,20 @@ void VaClient::loop() {
     const bool timed_out =
         (millis() - this->speaker_stop_wait_started_ms_) >= kSpeakerStopTimeoutMs;
     if (speaker_drained || timed_out) {
+      const uint32_t graceful_close_token = this->graceful_close_token_.load();
+      const uint32_t request_follow_up_token = this->request_follow_up_token_.load();
+      const bool was_request =
+          this->request_follow_up_pending_ && request_follow_up_token != 0 &&
+          graceful_close_token == 0;
+      if (timed_out && !speaker_drained && was_request) {
+        ESP_LOGW(TAG,
+                 "speaker still had buffered data after %u ms — explicit "
+                 "follow-up revoked (fail closed)",
+                 (unsigned) kSpeakerStopTimeoutMs);
+        this->waiting_for_speaker_stop_ = false;
+        this->revoke_followup_("speaker_drain_timeout", true);
+        return;
+      }
       if (timed_out && !speaker_drained) {
         ESP_LOGW(TAG,
                  "speaker still had buffered data after %u ms — "
@@ -275,9 +329,6 @@ void VaClient::loop() {
                  (unsigned) kSpeakerStopTimeoutMs);
       }
       this->waiting_for_speaker_stop_ = false;
-      const uint32_t graceful_close_token = this->graceful_close_token_.load();
-      const bool was_request =
-          this->request_follow_up_pending_ && graceful_close_token == 0;
       this->followup_pending_ = false;
       this->request_follow_up_pending_ = false;
       if (graceful_close_token != 0) {
@@ -285,9 +336,18 @@ void VaClient::loop() {
         // in replying through the same tail delay used before a normal follow-up.
         this->followup_armed_ = false;
         const uint32_t tail_delay = this->followup_open_delay_ms_;
+        const ControlContext graceful_context = this->control_context_();
         ESP_LOGI(TAG, "graceful close — final buffers drained; idle in %u ms",
                  (unsigned) tail_delay);
-        this->set_timeout("va_graceful_close", tail_delay, [this, graceful_close_token]() {
+        this->set_timeout("va_graceful_close", tail_delay,
+                          [this, graceful_close_token, graceful_context]() {
+          std::lock_guard<GenerationEffectGate> effect_guard(
+              this->generation_effect_gate_);
+          const ControlContext current_context = this->control_context_();
+          if (current_context.session_nonce != graceful_context.session_nonce ||
+              current_context.wake_generation != graceful_context.wake_generation ||
+              current_context.effect_epoch != graceful_context.effect_epoch)
+            return;
           uint32_t expected = graceful_close_token;
           if (!this->graceful_close_token_.compare_exchange_strong(expected, 0))
             return;
@@ -296,13 +356,50 @@ void VaClient::loop() {
         });
       } else if (was_request) {
         // Request-driven path: speaker has drained, now hand off to yaml
-        // for the chime → wait_until !is_announcing → commit_followup_mic
-        // sequence (announcement lane is separate from the TTS lane we
+        // for the chime → wait_until !is_announcing → READY sequence
+        // (announcement lane is separate from the TTS lane we
         // just waited on, so the chime won't collide with our tail).
         this->open_followup_window_(0);  // emit deferred LED idle + latency log; no mic
-        this->followup_armed_ = true;
+        bool fire_callback = false;
+        bool callback_conflict = false;
+        uint32_t request_session_nonce = 0;
+        portENTER_CRITICAL(&this->followup_mux_);
+        const FollowUpCredentials credentials = this->lifecycle_.credentials();
+        request_session_nonce = credentials.session_nonce;
+        if (this->lifecycle_.follow_up_stage() == FollowUpStage::PREPARED &&
+            credentials.token == request_follow_up_token &&
+            request_session_nonce != 0 && this->lifecycle_.active_wake()) {
+          if (this->request_follow_up_callback_in_flight_.load()) {
+            callback_conflict = true;
+          } else {
+            this->request_follow_up_callback_in_flight_ = true;
+            this->request_follow_up_callback_token_ = request_follow_up_token;
+            this->request_follow_up_callback_session_nonce_ = request_session_nonce;
+            this->followup_armed_ = true;
+            fire_callback = true;
+          }
+        }
+        portEXIT_CRITICAL(&this->followup_mux_);
+        if (!fire_callback && !callback_conflict) {
+          ESP_LOGW(TAG, "follow-up credentials changed before callback — revoked");
+          this->revoke_followup_("callback_credentials_changed", true);
+          return;
+        }
+        if (callback_conflict) {
+          ESP_LOGW(TAG, "follow-up YAML callback already in flight; rejecting request");
+          this->revoke_followup_("callback_conflict", true);
+          return;
+        }
+        this->set_timeout(
+            "va_followup_commit", kRequestFollowUpReadyTimeoutMs,
+            [this, request_follow_up_token, request_session_nonce]() {
+              std::lock_guard<GenerationEffectGate> effect_guard(
+                  this->generation_effect_gate_);
+              ESP_LOGW(TAG, "follow-up chime callback timed out — request revoked");
+              this->abort_followup_mic(request_follow_up_token, request_session_nonce);
+            });
         for (auto *t : this->followup_opened_triggers_) {
-          t->trigger();
+          t->trigger(request_follow_up_token, request_session_nonce);
         }
       } else {
         // Natural-idle path: emit the deferred LED idle, and — if the backend
@@ -388,22 +485,38 @@ void VaClient::schedule_reconnect_() {
     this->reconnect_delay_ms_ = 10000;
   }
   this->set_timeout("va_reconnect", delay, [this]() {
+    std::lock_guard<GenerationEffectGate> effect_guard(
+        this->generation_effect_gate_);
     this->reconnect_pending_ = false;
     this->connect_();
   });
 }
 
 void VaClient::on_ws_event(int32_t event_id, void *event_data) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
   auto *data = static_cast<esp_websocket_event_data_t *>(event_data);
   switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED: {
       ESP_LOGI(TAG, "WS connected");
+      uint32_t connection_generation = this->ws_connection_generation_.load() + 1;
+      if (connection_generation == 0)
+        connection_generation = 1;
+      this->ws_connection_generation_ = connection_generation;
       this->ws_connected_ = true;
+      this->transport_admission_.on_transport_connected();
+      this->ws_reassembler_.reset();
+      this->session_nonce_ = 0;
+      portENTER_CRITICAL(&this->followup_mux_);
+      this->lifecycle_.on_connected();
+      portEXIT_CRITICAL(&this->followup_mux_);
+      this->revoke_followup_("connect", false);
       this->reconnect_delay_ms_ = 1000;  // reset backoff on a clean open
       // Don't reset the failure counter / fired flag yet — a flap-and-die
       // link would spam chimes. Only re-arm after the connection has held
       // for kStableConnectionMs without a disconnect.
       this->set_timeout("va_stable_connection", kStableConnectionMs, [this]() {
+        std::lock_guard<GenerationEffectGate> effect_guard(
+            this->generation_effect_gate_);
         if (this->ws_connected_) {
           this->consecutive_failures_ = 0;
           this->repeated_failure_fired_ = false;
@@ -412,33 +525,36 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
         }
       });
 
-      const char start_msg[] = "{\"type\":\"start\"}";
-      auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-      esp_websocket_client_send_text(handle, start_msg, sizeof(start_msg) - 1, portMAX_DELAY);
+      if (!this->send_text_bounded_("{\"type\":\"start\"}", "start")) {
+        this->revoke_followup_("start_send_failed", false);
+      }
       this->set_phase_("idle");
       break;
     }
     case WEBSOCKET_EVENT_DATA: {
-      if (data == nullptr || data->data_ptr == nullptr || data->data_len <= 0)
+      if (data == nullptr || data->data_len < 0 || data->payload_len < 0 ||
+          data->payload_offset < 0 ||
+          (data->data_ptr == nullptr && data->data_len != 0)) {
+        ESP_LOGW(TAG, "invalid WebSocket event metadata rejected");
+        this->ws_reassembler_.reset();
+        this->revoke_followup_("malformed_ws_event", true);
         break;
-      // op_code: 0x01 = text, 0x02 = binary, 0x00 = continuation of the prior
-      // frame. esp_websocket_client splits long messages, so we must track the
-      // type from the first chunk and feed continuations to the same handler.
-      uint8_t op = data->op_code;
-      if (op == 0x01) {
-        this->last_data_was_binary_ = false;
-        this->handle_text_(data->data_ptr, static_cast<size_t>(data->data_len));
-      } else if (op == 0x02) {
-        this->last_data_was_binary_ = true;
-        this->handle_binary_(reinterpret_cast<const uint8_t *>(data->data_ptr),
-                             static_cast<size_t>(data->data_len));
-      } else if (op == 0x00) {
-        // Continuation. Route based on the type of the in-flight message.
-        if (this->last_data_was_binary_) {
-          this->handle_binary_(reinterpret_cast<const uint8_t *>(data->data_ptr),
-                               static_cast<size_t>(data->data_len));
-        } else {
-          this->handle_text_(data->data_ptr, static_cast<size_t>(data->data_len));
+      }
+      const auto result = this->ws_reassembler_.push(
+          data->op_code, data->fin, static_cast<size_t>(data->payload_len),
+          static_cast<size_t>(data->payload_offset),
+          reinterpret_cast<const uint8_t *>(data->data_ptr),
+          static_cast<size_t>(data->data_len));
+      if (result.status == WsReassemblyStatus::REJECTED) {
+        ESP_LOGW(TAG, "malformed or oversized WebSocket message rejected");
+        this->revoke_followup_("malformed_ws_message", true);
+      } else if (result.status == WsReassemblyStatus::COMPLETE) {
+        const auto &message = this->ws_reassembler_.message();
+        if (result.type == WsMessageType::TEXT) {
+          this->handle_text_(reinterpret_cast<const char *>(message.data()),
+                             message.size());
+        } else if (result.type == WsMessageType::BINARY) {
+          this->handle_binary_(message.data(), message.size());
         }
       }
       break;
@@ -450,6 +566,13 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
         ESP_LOGW(TAG, "WS disconnected (event %d)", (int) event_id);
       }
       this->ws_connected_ = false;
+      this->transport_admission_.on_transport_disconnected();
+      this->ws_reassembler_.reset();
+      this->session_nonce_ = 0;
+      portENTER_CRITICAL(&this->followup_mux_);
+      this->lifecycle_.on_disconnected();
+      portEXIT_CRITICAL(&this->followup_mux_);
+      this->revoke_followup_("disconnect", false);
       // A dropped WS mid-enrollment must not leave the mic pinned open with
       // nobody recording — exit enrollment locally (no notify; link is gone).
       if (this->enroll_mode_)
@@ -468,11 +591,38 @@ void VaClient::on_ws_event(int32_t event_id, void *event_data) {
 }
 
 void VaClient::handle_text_(const char *data, size_t len) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
   std::string msg(data, len);
-  ESP_LOGD(TAG, "WS text: %s", msg.c_str());
+  FlatJsonObject message;
+  std::string type;
+  if (!message.parse(msg) || !message.get_string("type", type)) {
+    ESP_LOGW(TAG, "malformed control message — follow-up privilege revoked");
+    this->revoke_followup_("malformed_control", true);
+    return;
+  }
+  // Tokens and nonces are bearer credentials during a wake. Never emit the raw
+  // control frame into logs where another local reader could replay them.
+  ESP_LOGD(TAG, "WS text type: %s", type.c_str());
 
-  if (msg.find("\"type\":\"error\"") != std::string::npos) {
-    ESP_LOGW(TAG, "Server reported error: %s", msg.c_str());
+  if (type == "hello" && !this->transport_admission_.can_admit_session()) {
+    ESP_LOGW(TAG, "hello rejected until the faulted transport reconnects");
+    return;
+  }
+
+  if (type != "hello") {
+    bool admitted = false;
+    portENTER_CRITICAL(&this->followup_mux_);
+    admitted = this->lifecycle_.connected() && this->lifecycle_.authorized();
+    portEXIT_CRITICAL(&this->followup_mux_);
+    if (!admitted) {
+      ESP_LOGW(TAG, "control before admitted hello rejected");
+      this->revoke_followup_("control_before_hello", false);
+      return;
+    }
+  }
+
+  if (type == "error") {
+    ESP_LOGW(TAG, "server reported an error");
     // Without an audible cue the user just sees the LED go idle and
     // assumes the assistant ignored them. Reuse the on_repeated_failure
     // trigger — it already plays error_cloud_expired and the failure
@@ -486,90 +636,331 @@ void VaClient::handle_text_(const char *data, size_t len) {
         t->trigger();
       }
     });
+    this->revoke_followup_("backend_error", false);
     this->set_phase_("idle");
     return;
   }
 
-  if (msg.find("\"type\":\"hello\"") != std::string::npos) {
-    // Handshake ack from the backend. It may carry follow-up tuning so the
-    // device behaviour is configurable from the add-on (no reflash): a reconnect
-    // after an add-on restart re-reads these.
-    //   "follow_up_ms":N            — how long the mic stays open after a reply
-    //                                 so the user can answer without a wake word.
-    //   "follow_up_open_delay_ms":N — delay before that mic opens, to let the
-    //                                 reply's i2s/DAC tail finish playing out.
-    uint32_t v = 0;
-    if (parse_uint_after_key(msg, "\"follow_up_ms\":", v)) {
-      if (v > kFollowupMsMax)
-        v = kFollowupMsMax;
-      this->followup_ms_ = v;
-      ESP_LOGI(TAG, "hello: follow-up window = %u ms (%s)", (unsigned) v,
-               v == 0 ? "disabled, turn-based" : "mic stays open after replies");
-    }
-    if (parse_uint_after_key(msg, "\"follow_up_open_delay_ms\":", v)) {
-      if (v > kFollowupOpenDelayMaxMs)
-        v = kFollowupOpenDelayMaxMs;
-      this->followup_open_delay_ms_ = v;
-      ESP_LOGI(TAG, "hello: follow-up mic-open delay = %u ms", (unsigned) v);
-    }
-    if (parse_uint_after_key(msg, "\"wake_open_delay_ms\":", v)) {
-      if (v > kFollowupOpenDelayMaxMs)  // reuse the same 5 s ceiling
-        v = kFollowupOpenDelayMaxMs;
-      this->wake_open_delay_ms_ = v;
-      ESP_LOGI(TAG, "hello: wake mic-open delay = %u ms", (unsigned) v);
-    }
-    if (parse_uint_after_key(msg, "\"playback_prebuffer_ms\":", v)) {
-      if (v > kPlaybackPrebufferMaxMs)
-        v = kPlaybackPrebufferMaxMs;
+  if (type == "hello") {
+    const bool nonce_field_present = message.has("nonce");
+    std::string audio_out;
+    uint32_t nonce = 0;
+    uint32_t follow_up_ms = 0;
+    uint32_t follow_up_open_delay_ms = 0;
+    uint32_t wake_open_delay_ms = 0;
+    uint32_t playback_prebuffer_ms = 0;
+    const bool exact_shape = nonce_field_present
+                                 ? message.has_exact(
+                                       {"type", "nonce", "audio_out", "follow_up_ms",
+                                        "follow_up_open_delay_ms", "wake_open_delay_ms",
+                                        "playback_prebuffer_ms"})
+                                 : message.has_exact(
+                                       {"type", "audio_out", "follow_up_ms",
+                                        "follow_up_open_delay_ms", "wake_open_delay_ms",
+                                        "playback_prebuffer_ms"});
+    const bool common_fields_valid =
+        exact_shape && message.get_string("audio_out", audio_out) && audio_out == "pcm" &&
+        message.get_uint("follow_up_ms", follow_up_ms) &&
+        follow_up_ms == 0 &&
+        message.get_uint("follow_up_open_delay_ms", follow_up_open_delay_ms) &&
+        follow_up_open_delay_ms <= kFollowupOpenDelayMaxMs &&
+        message.get_uint("wake_open_delay_ms", wake_open_delay_ms) &&
+        wake_open_delay_ms <= kFollowupOpenDelayMaxMs &&
+        message.get_uint("playback_prebuffer_ms", playback_prebuffer_ms) &&
+        playback_prebuffer_ms <= kPlaybackPrebufferMaxMs;
+
+    if (!nonce_field_present) {
+      bool accepted = false;
+      portENTER_CRITICAL(&this->followup_mux_);
+      if (common_fields_valid)
+        accepted = this->lifecycle_.admit_legacy_zero_hello();
+      else
+        this->lifecycle_.reject_hello();
+      portEXIT_CRITICAL(&this->followup_mux_);
+      this->session_nonce_ = 0;
+      this->revoke_followup_(accepted ? "legacy_hello" : "legacy_hello_rejected", false);
+      if (!accepted) {
+        ESP_LOGW(TAG, "legacy hello rejected: exact backend 0.20.6 zero-mode shape required");
+        return;
+      }
+      this->followup_ms_ = 0;
+      this->followup_open_delay_ms_ = follow_up_open_delay_ms;
+      this->wake_open_delay_ms_ = wake_open_delay_ms;
       portENTER_CRITICAL(&this->ring_mux_);
-      this->playback_prebuffer_ms_ = v;
-      if (v == 0) {
+      this->playback_prebuffer_ms_ = playback_prebuffer_ms;
+      this->playback_prebuffer_pending_ = false;
+      this->playback_priming_ = false;
+      this->prime_started_ms_ = 0;
+      portEXIT_CRITICAL(&this->ring_mux_);
+      if (!this->transport_admission_.on_session_admitted()) {
+        portENTER_CRITICAL(&this->followup_mux_);
+        this->lifecycle_.reject_hello();
+        portEXIT_CRITICAL(&this->followup_mux_);
+        ESP_LOGW(TAG, "legacy hello rejected on a quarantined transport");
+        return;
+      }
+      ESP_LOGI(TAG, "exact legacy zero-mode hello applied; explicit follow-up unavailable");
+      return;
+    }
+
+    const bool trusted_fields_valid =
+        common_fields_valid && message.get_uint("nonce", nonce) && nonce != 0 &&
+        nonce <= kProtocolTokenMax;
+    portENTER_CRITICAL(&this->ring_mux_);
+    const uint32_t current_playback_prebuffer_ms = this->playback_prebuffer_ms_;
+    portEXIT_CRITICAL(&this->ring_mux_);
+    HelloAdmission admission = HelloAdmission::REJECTED;
+    portENTER_CRITICAL(&this->followup_mux_);
+    if (trusted_fields_valid)
+      admission = this->lifecycle_.admit_trusted_hello(nonce);
+    else
+      this->lifecycle_.reject_hello();
+    portEXIT_CRITICAL(&this->followup_mux_);
+    const bool recovery_values_match =
+        admission != HelloAdmission::RECOVERY ||
+        (this->followup_ms_.load() == 0 &&
+         this->followup_open_delay_ms_.load() == follow_up_open_delay_ms &&
+         this->wake_open_delay_ms_.load() == wake_open_delay_ms &&
+         current_playback_prebuffer_ms == playback_prebuffer_ms);
+    const bool accepted = admission != HelloAdmission::REJECTED && recovery_values_match;
+    if (accepted) {
+      this->revoke_followup_(admission == HelloAdmission::RECOVERY ? "hello_recovery" : "hello", false);
+      this->followup_ms_ = follow_up_ms;
+      this->followup_open_delay_ms_ = follow_up_open_delay_ms;
+      this->wake_open_delay_ms_ = wake_open_delay_ms;
+      portENTER_CRITICAL(&this->ring_mux_);
+      this->playback_prebuffer_ms_ = playback_prebuffer_ms;
+      if (playback_prebuffer_ms == 0) {
         this->playback_prebuffer_pending_ = false;
         this->playback_priming_ = false;
         this->prime_started_ms_ = 0;
       }
       portEXIT_CRITICAL(&this->ring_mux_);
-      ESP_LOGI(TAG, "hello: playback prebuffer (jitter buffer) = %u ms (%s)", (unsigned) v,
-               v == 0 ? "disabled" : "cushion before playback");
+      this->session_nonce_ = nonce;
+      ESP_LOGI(TAG,
+                "strict hello applied: follow-up=%u ms open-delay=%u ms wake-delay=%u ms "
+                "prebuffer=%u ms",
+               (unsigned) this->followup_ms_,
+               (unsigned) this->followup_open_delay_ms_,
+               (unsigned) this->wake_open_delay_ms_,
+               (unsigned) this->playback_prebuffer_ms_);
+    } else {
+      this->session_nonce_ = 0;
+      portENTER_CRITICAL(&this->followup_mux_);
+      this->lifecycle_.reject_hello();
+      portEXIT_CRITICAL(&this->followup_mux_);
+      this->revoke_followup_("hello_rejected", false);
+      ESP_LOGW(TAG, "hello rejected: exact fields, pcm audio, fresh nonce, and zero mode required");
+    }
+    const bool ack_sent = this->send_hello_ack_(nonce, accepted);
+    if (accepted && ack_sent && this->session_nonce_.load() == nonce) {
+      if (!this->transport_admission_.on_session_admitted()) {
+        this->session_nonce_ = 0;
+        portENTER_CRITICAL(&this->followup_mux_);
+        this->lifecycle_.reject_hello();
+        portEXIT_CRITICAL(&this->followup_mux_);
+        ESP_LOGW(TAG, "trusted hello rejected on a quarantined transport");
+      }
+    }
+    if (accepted && this->session_nonce_.load() != nonce) {
+      ESP_LOGW(TAG, "hello ACK failed; trusted session revoked");
     }
     return;
   }
 
-  if (msg.find("\"type\":\"request_follow_up\"") != std::string::npos) {
-    // Server's model called the request_follow_up tool — it asked a
-    // question and wants the user to answer without saying a wake word.
-    // Defer to loop()'s waiting_for_speaker_stop_ logic so we only fire
-    // the chime + arm the mic after speaker_->is_stopped() returns true
-    // (i.e. the i2s pipeline has finished playing the question's audio).
-    // Setting both pending flags is idempotent — loop() handles both the
-    // "already drained" and "still queued" cases uniformly via the
-    // speaker-state poll.
-    ESP_LOGI(TAG, "request_follow_up — waiting for speaker drain (%u bytes queued)",
-             (unsigned) this->audio_fill_);
-    this->followup_pending_ = true;
-    this->request_follow_up_pending_ = true;
+  if (type == "request_follow_up") {
+    uint32_t token = 0;
+    uint32_t session_nonce = 0;
+    const bool message_shape_valid =
+        message.has_exact({"type", "token", "session_nonce"}) &&
+        message.get_uint("token", token) &&
+        message.get_uint("session_nonce", session_nonce);
+    const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
+    const bool microphone_ready = !this->microphone_is_muted_();
+    bool accepted = false;
+    portENTER_CRITICAL(&this->followup_mux_);
+    accepted = message_shape_valid && phase_now == Phase::REPLYING &&
+               this->followup_ms_.load() == 0 && !this->barge_in_ &&
+               microphone_ready &&
+               this->graceful_close_prepared_token_.load() == 0 &&
+               this->graceful_close_token_.load() == 0 &&
+               this->lifecycle_.prepare_follow_up(token, session_nonce);
+    if (accepted) {
+      this->request_follow_up_token_ = token;
+      this->followup_pending_ = false;
+      this->waiting_for_speaker_stop_ = false;
+      this->request_follow_up_pending_ = true;
+      this->followup_armed_ = false;
+      this->streaming_ = false;
+    }
+    portEXIT_CRITICAL(&this->followup_mux_);
+    if (accepted) {
+      ESP_LOGI(TAG, "request_follow_up accepted; waiting for idle + drain");
+    } else {
+      ESP_LOGW(TAG, "request_follow_up rejected (phase=%s mode=%u)",
+               phase_name_(phase_now), (unsigned) this->followup_ms_);
+      // A malformed, stale, replayed, or competing request makes ownership
+      // ambiguous. Burn nothing new, but revoke this wake until a local wake.
+      this->revoke_followup_("prepare_rejected", false);
+    }
+    const bool ack_sent = this->send_request_follow_up_ack_(token, session_nonce, accepted);
+    if (accepted && !ack_sent)
+      this->revoke_followup_("prepare_ack_failed", false);
     return;
   }
 
-  if (msg.find("\"type\":\"prepare_suppress_followup\"") != std::string::npos) {
+  if (type == "cancel_request_follow_up") {
     uint32_t token = 0;
-    const bool has_token = parse_uint_after_key(msg, "\"token\":", token) && token != 0;
+    uint32_t session_nonce = 0;
+    const bool shape_valid =
+        message.has_exact({"type", "token", "session_nonce"}) &&
+        message.get_uint("token", token) && token != 0 &&
+        token <= kProtocolTokenMax &&
+        message.get_uint("session_nonce", session_nonce) &&
+        session_nonce != 0 && session_nonce <= kProtocolTokenMax;
+    bool accepted = false;
+    portENTER_CRITICAL(&this->followup_mux_);
+    const FollowUpCredentials credentials = this->lifecycle_.credentials();
+    accepted = shape_valid && this->lifecycle_.follow_up_stage() != FollowUpStage::NONE &&
+               credentials.token == token && credentials.session_nonce == session_nonce;
+    this->lifecycle_.revoke();
+    portEXIT_CRITICAL(&this->followup_mux_);
+    if (accepted) {
+      ESP_LOGI(TAG, "request_follow_up cancelled");
+    } else {
+      ESP_LOGW(TAG, "stale or malformed request_follow_up cancellation rejected");
+    }
+    this->revoke_followup_(accepted ? "cancelled" : "cancel_rejected", false);
+    this->send_cancel_request_follow_up_ack_(
+        token, session_nonce, accepted, accepted);
+    return;
+  }
+
+  if (type == "commit_follow_up") {
+    uint32_t token = 0;
+    uint32_t session_nonce = 0;
+    uint32_t ready_nonce = 0;
+    const bool shape_valid =
+        message.has_exact({"type", "token", "session_nonce", "ready_nonce"}) &&
+        message.get_uint("token", token) && message.get_uint("session_nonce", session_nonce) &&
+        message.get_uint("ready_nonce", ready_nonce);
+    uint32_t audio_generation = 0;
+    uint32_t wake_generation = 0;
+    bool commit_safe = false;
+    const bool microphone_muted = this->microphone_is_muted_();
+    const bool initial_announcement_clear = this->announcement_path_clear_();
+    portENTER_CRITICAL(&this->followup_mux_);
+    this->lifecycle_.set_muted(microphone_muted);
+    audio_generation = this->lifecycle_.audio_generation();
+    wake_generation = this->lifecycle_.credentials().wake_generation;
+    commit_safe = shape_valid && initial_announcement_clear &&
+                  this->mic_send_fence_.in_flight() == 0 &&
+                  this->lifecycle_.commit_is_safe(
+                      token, session_nonce, ready_nonce, audio_generation,
+                      initial_announcement_clear);
+    if (!commit_safe)
+      this->lifecycle_.revoke();
+    portEXIT_CRITICAL(&this->followup_mux_);
+
+    if (!commit_safe) {
+      this->revoke_followup_("commit_rejected", false);
+      this->send_follow_up_commit_ack_(token, session_nonce, ready_nonce, false);
+      return;
+    }
+
+    // The accepted ACK is sent while the mic is still closed. Only an exact,
+    // bounded send followed by a second local safety check may open it.
+    if (!this->send_follow_up_commit_ack_(token, session_nonce, ready_nonce, true)) {
+      this->revoke_followup_("commit_ack_failed", false);
+      return;
+    }
+
+    bool ring_empty = false;
+    portENTER_CRITICAL(&this->ring_mux_);
+    ring_empty = this->audio_fill_ == 0;
+    portEXIT_CRITICAL(&this->ring_mux_);
+    const bool speaker_drained =
+        this->speaker_ != nullptr && !this->speaker_->has_buffered_data();
+    const bool announcement_clear = this->announcement_path_clear_();
+    const bool microphone_ready = !this->microphone_is_muted_();
+    bool opened = false;
+    portENTER_CRITICAL(&this->followup_mux_);
+    const uint32_t final_audio_generation = this->lifecycle_.audio_generation();
+    if (ring_empty && speaker_drained && announcement_clear && microphone_ready &&
+        this->mic_send_fence_.in_flight() == 0 &&
+        final_audio_generation == audio_generation) {
+      opened = this->lifecycle_.open_follow_up_after_commit(
+          token, session_nonce, ready_nonce, final_audio_generation,
+          announcement_clear);
+      if (opened) {
+        this->streaming_ = true;
+      }
+    } else {
+      this->lifecycle_.revoke();
+    }
+    portEXIT_CRITICAL(&this->followup_mux_);
+    if (!opened) {
+      this->revoke_followup_("commit_race", true);
+      return;
+    }
+
+    this->preroll_discard_pending_ = true;
+    this->cancel_timeout("va_followup_commit");
+    ESP_LOGI(TAG, "two-phase follow-up mic open; hard timeout=%u ms",
+             (unsigned) kRequestFollowUpMs);
+    this->set_timeout(
+        "va_request_follow_up_hard", kRequestFollowUpMs,
+        [this, wake_generation, ready_nonce]() {
+          std::lock_guard<GenerationEffectGate> effect_guard(
+              this->generation_effect_gate_);
+          bool matches = false;
+          uint32_t session_nonce = 0;
+          portENTER_CRITICAL(&this->followup_mux_);
+          matches = this->lifecycle_.hard_timeout_matches(wake_generation, ready_nonce);
+          if (matches) {
+            session_nonce = this->lifecycle_.session_nonce();
+            this->lifecycle_.revoke();
+            this->streaming_ = false;
+          }
+          portEXIT_CRITICAL(&this->followup_mux_);
+          if (!matches)
+            return;
+          if (!this->wait_for_mic_send_barrier_(
+                  "follow_up_timeout_mic_send_barrier_failed"))
+            return;
+          this->send_mic_flush_(session_nonce, wake_generation);
+          this->send_interrupt_control_("follow_up_timeout", session_nonce,
+                                        wake_generation);
+          this->fire_phase_led_("idle");
+        });
+    this->fire_phase_led_("listening");
+    return;
+  }
+
+  if (type == "prepare_suppress_followup") {
+    uint32_t token = 0;
+    const bool has_token = message.has_exact({"type", "token"}) &&
+                           message.get_uint("token", token) && token != 0;
     const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
     const bool accepted = has_token &&
-                          (phase_now == Phase::THINKING || phase_now == Phase::REPLYING);
+                           this->request_follow_up_token_.load() == 0 &&
+                           (phase_now == Phase::THINKING || phase_now == Phase::REPLYING);
     if (accepted) {
+      this->revoke_followup_("graceful_prepare", false);
       this->graceful_close_prepared_token_ = token;
-      ESP_LOGI(TAG, "graceful close prepared (token=%u)", (unsigned) token);
+      ESP_LOGI(TAG, "graceful close prepared");
     } else {
       ESP_LOGW(TAG, "graceful close prepare rejected in phase=%s", phase_name_(phase_now));
+      this->revoke_followup_("graceful_prepare_rejected", true);
     }
     this->send_graceful_close_ack_("prepared", token, accepted);
     return;
   }
 
-  if (msg.find("\"type\":\"commit_suppress_followup\"") != std::string::npos) {
+  if (type == "commit_suppress_followup") {
     uint32_t token = 0;
-    const bool has_token = parse_uint_after_key(msg, "\"token\":", token) && token != 0;
+    const bool has_token = message.has_exact({"type", "token"}) &&
+                           message.get_uint("token", token) && token != 0;
     const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
     const bool accepted = has_token &&
                           this->graceful_close_prepared_token_.load() == token &&
@@ -577,41 +968,74 @@ void VaClient::handle_text_(const char *data, size_t len) {
     if (accepted) {
       this->graceful_close_prepared_token_ = 0;
       this->graceful_close_token_ = token;
-      ESP_LOGI(TAG, "graceful close committed (token=%u)", (unsigned) token);
+      ESP_LOGI(TAG, "graceful close committed");
     } else {
       ESP_LOGW(TAG, "graceful close commit rejected in phase=%s", phase_name_(phase_now));
+      this->revoke_followup_("graceful_commit_rejected", true);
     }
     this->send_graceful_close_ack_("committed", token, accepted);
     return;
   }
 
-  if (msg.find("\"type\":\"cancel_suppress_followup\"") != std::string::npos) {
+  if (type == "cancel_suppress_followup") {
     uint32_t token = 0;
-    if (parse_uint_after_key(msg, "\"token\":", token) && token != 0) {
+    this->revoke_followup_("graceful_cancel", false);
+    if (message.has_exact({"type", "token"}) &&
+        message.get_uint("token", token) && token != 0) {
       if (this->graceful_close_prepared_token_.load() == token)
         this->graceful_close_prepared_token_ = 0;
       if (this->graceful_close_token_.load() == token) {
         this->graceful_close_token_ = 0;
         this->cancel_timeout("va_graceful_close");
       }
-      ESP_LOGI(TAG, "graceful close cancelled (token=%u)", (unsigned) token);
+      ESP_LOGI(TAG, "graceful close cancelled");
     }
     return;
   }
 
-  if (msg.find("\"type\":\"ack\"") != std::string::npos) {
+  if (type == "ack") {
     // Backend confirms mic audio is flowing for this turn. Cancel the
     // no-speech abort: with semantic VAD the "speech detected" phase can
     // arrive only at utterance COMMIT, which for longer commands lands past
     // any reasonable fixed timeout (community report: aborts mid-sentence).
     // Silent misfires still close via the follow-up window flush timers.
-    this->cancel_timeout("va_no_speech");
-    ESP_LOGD(TAG, "backend audio ack — no-speech watchdog cancelled");
+    uint32_t session_nonce = 0;
+    uint32_t wake_generation = 0;
+    bool valid = false;
+    portENTER_CRITICAL(&this->followup_mux_);
+    const PilotAuthMode auth_mode = this->lifecycle_.auth_mode();
+    if (auth_mode == PilotAuthMode::LEGACY_ZERO) {
+      valid = message.has_exact({"type"}) && this->lifecycle_.active_wake();
+    } else if (auth_mode == PilotAuthMode::NONCE) {
+      valid = message.has_exact({"type", "session_nonce", "wake_generation"}) &&
+              message.get_uint("session_nonce", session_nonce) &&
+              message.get_uint("wake_generation", wake_generation) &&
+              session_nonce == this->lifecycle_.session_nonce() &&
+              wake_generation == this->lifecycle_.wake_generation() &&
+              this->lifecycle_.active_wake();
+    }
+    portEXIT_CRITICAL(&this->followup_mux_);
+    if (valid) {
+      this->cancel_timeout("va_no_speech");
+      ESP_LOGD(TAG, "current backend audio ACK cancelled silent-wake timeout");
+    } else {
+      ESP_LOGW(TAG, "stale or malformed backend audio ACK rejected");
+      this->revoke_followup_("stale_audio_ack", true);
+    }
     return;
   }
 
-  if (msg.find("\"type\":\"enroll\"") != std::string::npos) {
-    const bool start = msg.find("\"mode\":\"start\"") != std::string::npos;
+  if (type == "enroll") {
+    std::string mode;
+    if (!message.has_exact({"type", "mode"}) ||
+        !message.get_string("mode", mode) ||
+        (mode != "start" && mode != "stop")) {
+      ESP_LOGW(TAG, "malformed enrollment control rejected");
+      this->revoke_followup_("malformed_enroll", true);
+      return;
+    }
+    const bool start = mode == "start";
+    this->revoke_followup_("enroll_control", false);
     ESP_LOGI(TAG, "enroll control from backend: %s", start ? "start" : "stop");
     this->defer([this, start]() {
       if (start)
@@ -622,16 +1046,78 @@ void VaClient::handle_text_(const char *data, size_t len) {
     return;
   }
 
-  // Substring match on `"value":"<phase>"` — keeps us out of a JSON parser
-  // until M3 needs richer payloads.
-  static const char *const kPhases[] = {"listening", "thinking", "replying", "idle"};
-  for (const char *p : kPhases) {
-    std::string needle = std::string("\"value\":\"") + p + "\"";
-    if (msg.find(needle) != std::string::npos) {
-      this->set_phase_(p);
+  if (type == "phase") {
+    if (this->enroll_mode_) {
+      ESP_LOGD(TAG, "ignoring backend phase during enrollment");
       return;
     }
+    std::string value;
+    uint32_t session_nonce = 0;
+    uint32_t wake_generation = 0;
+    const bool value_valid = message.get_string("value", value);
+    const bool legacy_shape =
+        value_valid && message.has_exact({"type", "value"});
+    const bool trusted_shape =
+        value_valid &&
+        message.has_exact(
+            {"type", "value", "session_nonce", "wake_generation"}) &&
+        message.get_uint("session_nonce", session_nonce) &&
+        message.get_uint("wake_generation", wake_generation);
+
+    PilotPhase lifecycle_phase = PilotPhase::IDLE;
+    Phase runtime_phase = Phase::IDLE;
+    bool known_phase = true;
+    if (value == "listening") {
+      lifecycle_phase = PilotPhase::LISTENING;
+      runtime_phase = Phase::LISTENING;
+    } else if (value == "thinking") {
+      lifecycle_phase = PilotPhase::THINKING;
+      runtime_phase = Phase::THINKING;
+    } else if (value == "replying") {
+      lifecycle_phase = PilotPhase::REPLYING;
+      runtime_phase = Phase::REPLYING;
+    } else if (value != "idle") {
+      known_phase = false;
+    }
+    if (!known_phase) {
+      this->revoke_followup_("unknown_phase", true);
+      return;
+    }
+
+    const bool microphone_muted = this->microphone_is_muted_();
+    const Phase runtime_previous =
+        static_cast<Phase>(this->current_phase_.load());
+    PhaseApplyResult transition;
+    portENTER_CRITICAL(&this->followup_mux_);
+    if (this->lifecycle_.legacy_zero()) {
+      if (legacy_shape) {
+        transition = this->lifecycle_.apply_legacy_phase(
+            lifecycle_phase, microphone_muted, this->barge_in_);
+      }
+    } else if (this->lifecycle_.trusted()) {
+      if (trusted_shape) {
+        transition = this->lifecycle_.apply_trusted_phase(
+            lifecycle_phase, session_nonce, wake_generation,
+            microphone_muted);
+      }
+    }
+    portEXIT_CRITICAL(&this->followup_mux_);
+
+    if (transition.status == PhaseApplyStatus::STALE) {
+      ESP_LOGD(TAG, "stale phase ignored without touching current wake");
+      return;
+    }
+    if (transition.status != PhaseApplyStatus::APPLIED) {
+      this->revoke_followup_("malformed_phase", true);
+      return;
+    }
+    this->apply_phase_side_effects_(value, runtime_phase, runtime_previous,
+                                    transition);
+    return;
   }
+
+  ESP_LOGW(TAG, "unknown control type rejected");
+  this->revoke_followup_("unknown_control", true);
 }
 
 void VaClient::handle_binary_(const uint8_t *data, size_t len) {
@@ -643,6 +1129,25 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   // next "idle"/"listening" phase (see set_phase_).
   if (this->suppress_incoming_audio_)
     return;
+  uint32_t audio_generation = 0;
+  bool admitted = false;
+  bool invalidated_follow_up = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  admitted = this->lifecycle_.connected() && this->lifecycle_.authorized();
+  if (admitted)
+    invalidated_follow_up = this->lifecycle_.assistant_audio(audio_generation);
+  if (invalidated_follow_up) {
+    this->streaming_ = false;
+  }
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (!admitted) {
+    ESP_LOGW(TAG, "audio before admitted hello rejected");
+    return;
+  }
+  if (invalidated_follow_up) {
+    ESP_LOGW(TAG, "assistant audio arrived outside the bound reply drain — follow-up revoked");
+    this->revoke_followup_("late_assistant_audio", true);
+  }
   const uint32_t now_ms = millis();
   if (this->turn_t_first_audio_out_ == 0 && this->turn_t_wake_ != 0) {
     this->turn_t_first_audio_out_ = now_ms;
@@ -658,7 +1163,7 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
       this->ws_gap_count_++;
       if (gap > this->ws_gap_max_ms_) this->ws_gap_max_ms_ = gap;
       ESP_LOGW(TAG, "ws audio gap: %u ms (ring fill %u bytes)",
-               (unsigned) gap, (unsigned) this->audio_fill_);
+               (unsigned) gap, (unsigned) this->audio_fill_snapshot_());
     }
   }
   this->last_binary_ms_ = now_ms;
@@ -666,9 +1171,13 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   // Snapshot audio_fill_ under the lock — it's modified by loop() on the
   // other core and we can't trust a torn read.
   size_t free_space;
+  uint32_t write_generation;
   portENTER_CRITICAL(&this->ring_mux_);
   free_space = kAudioBufBytes - this->audio_fill_;
+  write_generation = this->prebuffer_generation_;
   portEXIT_CRITICAL(&this->ring_mux_);
+  if (this->suppress_incoming_audio_)
+    return;
   if (len > free_space) {
     ESP_LOGW(TAG, "audio buffer overflow: dropping %u bytes (have %u free of %u total)",
              (unsigned) (len - free_space), (unsigned) free_space, (unsigned) kAudioBufBytes);
@@ -720,6 +1229,11 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
   // to guarantee that ordering — len is at most a few KB per WS frame
   // and PSRAM memcpy is ~10–20 µs, well under any audio deadline.
   portENTER_CRITICAL(&this->ring_mux_);
+  if (this->prebuffer_generation_ != write_generation ||
+      this->suppress_incoming_audio_) {
+    portEXIT_CRITICAL(&this->ring_mux_);
+    return;
+  }
   const bool was_empty = (this->audio_fill_ == 0);
   size_t tail = this->audio_tail_;
   size_t first = std::min(len, kAudioBufBytes - tail);
@@ -773,12 +1287,42 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
   // rolling buffer kept around for a possible future capture-gating approach.
   // The session opens via start_session() (wake handler) and closes on
   // "phase":"idle" from the server (response.done).
-  if (!this->streaming_) {
+  bool owned_open_mic = false;
+  bool send_lease_acquired = false;
+  uint32_t send_lease_epoch = 0;
+  const bool microphone_muted = this->microphone_is_muted_();
+  {
+    std::lock_guard<GenerationEffectGate> effect_guard(
+        this->generation_effect_gate_);
+    portENTER_CRITICAL(&this->followup_mux_);
+    this->lifecycle_.set_muted(microphone_muted);
+    owned_open_mic = this->lifecycle_.mic_open();
+    if (!owned_open_mic)
+      this->streaming_ = false;
+    if (owned_open_mic && this->streaming_) {
+      send_lease_epoch = this->lifecycle_.mic_epoch();
+      this->mic_send_fence_.acquire();
+      send_lease_acquired = true;
+    }
+    portEXIT_CRITICAL(&this->followup_mux_);
+  }
+  if (!send_lease_acquired) {
     this->preroll_push_(this->mono_buf_.data(), this->mono_buf_.size());
     return;
   }
 
-  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+  bool send_lease_current = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  send_lease_current = this->streaming_ && MicSendFence::lease_is_current(
+                                                    send_lease_epoch,
+                                                    this->lifecycle_.mic_epoch(),
+                                                    this->lifecycle_.mic_open());
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (!send_lease_current) {
+    this->mic_send_fence_.release();
+    this->preroll_push_(this->mono_buf_.data(), this->mono_buf_.size());
+    return;
+  }
 
   // First frame of a fresh session: DISCARD the pre-roll instead of replaying
   // it. The ring caught the wake chime leaking through the mic (XMOS AEC leaves
@@ -794,12 +1338,24 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
     this->preroll_head_ = 0;
   }
 
-  // 10ms timeout (~portTICK_PERIOD_MS): if WS task is briefly busy we wait
-  // a tick rather than dropping the frame and spamming "Could not lock"
-  // errors. If we're swamped, we accept dropping rather than blocking mic.
-  esp_websocket_client_send_bin(handle, reinterpret_cast<const char *>(this->mono_buf_.data()),
-                                static_cast<int>(this->mono_buf_.size() * sizeof(int16_t)),
-                                10 / portTICK_PERIOD_MS);
+  const size_t payload_size = this->mono_buf_.size() * sizeof(int16_t);
+  const bool sent = this->send_binary_bounded_(
+      reinterpret_cast<const uint8_t *>(this->mono_buf_.data()), payload_size);
+  this->mic_send_fence_.release();
+  if (!sent) {
+    std::lock_guard<GenerationEffectGate> effect_guard(
+        this->generation_effect_gate_);
+    ControlContext context;
+    portENTER_CRITICAL(&this->followup_mux_);
+    context.session_nonce = this->lifecycle_.session_nonce();
+    context.wake_generation = this->lifecycle_.wake_generation();
+    this->lifecycle_.revoke();
+    this->streaming_ = false;
+    portEXIT_CRITICAL(&this->followup_mux_);
+    ESP_LOGW(TAG, "mic audio send failed or partial; local mic gate closed");
+    this->send_client_revoke_("audio_send_failed", context.session_nonce,
+                              context.wake_generation);
+  }
 }
 
 void VaClient::preroll_push_(const int16_t *data, size_t n) {
@@ -827,6 +1383,21 @@ VaClient::Phase VaClient::phase_from_string_(const std::string &phase) {
   return Phase::IDLE;
 }
 
+PilotPhase VaClient::pilot_phase_from_runtime_(Phase phase) {
+  switch (phase) {
+    case Phase::LISTENING:
+      return PilotPhase::LISTENING;
+    case Phase::THINKING:
+      return PilotPhase::THINKING;
+    case Phase::REPLYING:
+      return PilotPhase::REPLYING;
+    case Phase::ENROLLING:
+      return PilotPhase::ENROLLING;
+    default:
+      return PilotPhase::IDLE;
+  }
+}
+
 const char *VaClient::phase_name_(Phase p) {
   switch (p) {
     case Phase::LISTENING:
@@ -841,34 +1412,63 @@ const char *VaClient::phase_name_(Phase p) {
 }
 
 void VaClient::set_phase_(const std::string &phase) {
-  // Enrollment mode: the mic is pinned open and the backend's phase machine is
-  // not driving this device (mic audio is not forwarded to OpenAI). Stray
-  // phases — notably the hourly proactive-refresh force-idle — must not close
-  // the mic or repaint the LED mid-session.
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
   if (this->enroll_mode_ && phase != "enrolling") {
     ESP_LOGD(TAG, "ignoring phase '%s' during enrollment", phase.c_str());
     return;
   }
-  // Don't dedupe — we want yaml-side control_leds to re-render even on
-  // identical phase if other inputs (e.g. va WS connection state) have
-  // changed since the last emission.
   const Phase prev = static_cast<Phase>(this->current_phase_.load());
-  this->current_phase_.store(static_cast<uint8_t>(phase_from_string_(phase)));
-  ESP_LOGD(TAG, "Phase -> %s", phase.c_str());
+  const Phase runtime_phase = phase_from_string_(phase);
+  PhaseApplyResult transition;
+  transition.status = PhaseApplyStatus::APPLIED;
+  transition.previous = pilot_phase_from_runtime_(prev);
+  transition.target = pilot_phase_from_runtime_(runtime_phase);
+  portENTER_CRITICAL(&this->followup_mux_);
+  transition.active_after = this->lifecycle_.active_wake();
+  transition.connection_generation = this->lifecycle_.connection_generation();
+  transition.session_nonce = this->lifecycle_.session_nonce();
+  transition.wake_generation = this->lifecycle_.wake_generation();
+  transition.effect_epoch = this->lifecycle_.effect_epoch();
+  portEXIT_CRITICAL(&this->followup_mux_);
+  this->apply_phase_side_effects_(phase, runtime_phase, prev, transition);
+}
 
-  // Post-stop `thinking` guard. After a local "stop" the mic gate is closed
-  // (send_interrupt set post_stop_guard_), so no new turn can begin until a
-  // wake (start_session clears it). A `thinking` arriving here is the server
-  // VAD's end-of-turn for the utterance we just cancelled — acting on it
-  // strands the LED in `thinking` until the backend's 15 s watchdog (observed
-  // 2026-06-14: "stop" mid-question -> 15 s stuck thinking). Ignore it, keeping
-  // the prior phase. Scoped to `thinking`: a web search's replying->thinking
-  // has no stop (guard stays false), and a reply-drain emits no `thinking`.
-  if (this->post_stop_guard_ && phase == "thinking") {
-    this->current_phase_.store(static_cast<uint8_t>(prev));  // don't advance to the stale value
-    ESP_LOGI(TAG, "ignoring stale 'thinking' after stop (no wake since)");
+bool VaClient::phase_effect_plan_current_(
+    const PhaseApplyResult &transition) {
+  bool current = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  current = this->lifecycle_.phase_effect_plan_is_current(transition);
+  portEXIT_CRITICAL(&this->followup_mux_);
+  return current;
+}
+
+void VaClient::apply_phase_side_effects_(
+    const std::string &phase, Phase runtime_phase, Phase runtime_previous,
+    const PhaseApplyResult &transition) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  if (transition.target != pilot_phase_from_runtime_(runtime_phase) ||
+      static_cast<Phase>(this->current_phase_.load()) != runtime_previous ||
+      !this->phase_effect_plan_current_(transition)) {
+    ESP_LOGD(TAG, "superseded phase effect plan ignored");
     return;
   }
+  const Phase prev = runtime_previous;
+  this->current_phase_.store(static_cast<uint8_t>(runtime_phase));
+  portENTER_CRITICAL(&this->followup_mux_);
+  this->streaming_ = this->lifecycle_.mic_open();
+  portEXIT_CRITICAL(&this->followup_mux_);
+  ESP_LOGD(TAG, "Phase -> %s", phase.c_str());
+  if (transition.mic_closed &&
+      !this->wait_for_mic_send_barrier_(
+          "phase_close_mic_send_barrier_failed"))
+    return;
+  if (transition.follow_up_input_ended ||
+      transition.follow_up_window_completed) {
+    this->clear_request_follow_up_(false);
+    ESP_LOGI(TAG, "explicit follow-up input ended; response owner retained");
+  }
+  if (phase == "idle" && !transition.active_after)
+    this->cancel_timeout("va_session_ceiling");
 
   // Lift the post-"stop" incoming-audio suppression ONLY on "listening" — a
   // genuine fresh user turn whose reply is legitimate. We deliberately do NOT
@@ -889,42 +1489,28 @@ void VaClient::set_phase_(const std::string &phase) {
 
   // Streaming gate state machine:
   //   listening  → mic on (user is being heard)
-  //   thinking   → mic stays on. `thinking` only means "the VAD thinks the user
-  //                stopped", but with semantic_vad it can flap listening↔thinking
-  //                at the start of a turn while the user is still talking. No bot
-  //                audio plays during thinking (no echo risk), so keep streaming
-  //                until the reply genuinely begins — otherwise a spurious
-  //                `thinking` cuts the mic, the backend's input watchdog
-  //                force-ends the turn with no transcript, and the turn hangs.
-  //   replying   → mic off (bot is speaking; gate to avoid picking up our own
-  //                TTS in case the XMOS AEC isn't perfect). barge_in keeps it on.
-  //   idle       → mic on for kFollowupMs so the user can answer a question
-  //                without re-triggering the wake word. Timer expiry closes
-  //                the session.
+  //   thinking   → trusted input closes immediately; response ownership and
+  //                the physical wake generation remain active
+  //   replying   → trusted input remains closed; a model-selected follow-up
+  //                may consume the still-active wake's one-shot budget
+  //   idle       → terminal unless a PREPARED/READY explicit follow-up owns it
+  // Legacy zero mode retains its pre-0.19 barge-in behavior.
   if (phase == "listening") {
     // A genuine new user turn wins over any stale or late model close request.
     this->graceful_close_prepared_token_ = 0;
     this->graceful_close_token_ = 0;
     this->cancel_timeout("va_graceful_close");
-    if (!this->streaming_) {
-      ESP_LOGI(TAG, "phase=listening — mic streaming on");
-      this->streaming_ = true;
-    }
+    if (this->request_follow_up_token_.load() != 0)
+      this->clear_request_follow_up_(false);
+    ESP_LOGI(TAG, "phase=listening confirmed for current physical owner");
     // Handsfree barge-in cut-over: a `listening` arriving while we still have
     // TTS queued means the backend's server VAD heard the user talk over the
     // reply and already cancelled the OpenAI response. Drop the audio still in
     // our PSRAM ring so playback stops immediately instead of finishing the
     // now-cancelled sentence. We do NOT send a WS interrupt here — the backend
     // initiated this — we just stop local playback.
-    if (this->barge_in_ && this->audio_fill_ > 0) {
-      portENTER_CRITICAL(&this->ring_mux_);
-      this->audio_head_ = 0;
-      this->audio_tail_ = 0;
-      this->audio_fill_ = 0;
-      this->playback_prebuffer_pending_ = false;
-      this->playback_priming_ = false;
-      this->prime_started_ms_ = 0;
-      portEXIT_CRITICAL(&this->ring_mux_);
+    if (this->barge_in_ && this->audio_fill_snapshot_() > 0) {
+      this->close_audio_ring_();
       this->idle_emit_pending_ = false;
       ESP_LOGI(TAG, "phase=listening during reply — barge-in, flushed TTS queue");
     }
@@ -935,18 +1521,12 @@ void VaClient::set_phase_(const std::string &phase) {
     this->cancel_timeout("va_no_speech");
     this->cancel_timeout("va_followup");
   } else if (phase == "thinking" || phase == "replying") {
-    // Gate the mic off only once the bot actually starts speaking (`replying`).
-    // With handsfree barge-in we don't gate at all (the server VAD + XMOS AEC
-    // arbitrate talk-over). Crucially we do NOT gate on `thinking`: semantic_vad
-    // can flap listening↔thinking at the start of a turn while the user is still
-    // speaking, and cutting the mic on those spurious flaps starves the backend
-    // of audio → its input watchdog force-ends the turn with no transcript → the
-    // turn hangs in thinking. No bot audio plays during thinking, so there's no
-    // echo cost to keeping the mic open until the reply genuinely starts.
-    if (phase == "replying" && this->streaming_ && !this->barge_in_) {
-      ESP_LOGI(TAG, "phase=replying — mic streaming off");
-      this->streaming_ = false;
+    if (this->request_follow_up_token_.load() != 0) {
+      ESP_LOGW(TAG, "competing phase=%s revoked pending follow-up", phase.c_str());
+      this->revoke_followup_("competing_phase", true);
     }
+    if (!this->streaming_)
+      ESP_LOGI(TAG, "phase=%s — mic streaming off", phase.c_str());
     if (phase == "thinking" && this->turn_t_thinking_ == 0 && this->turn_t_wake_ != 0) {
       this->turn_t_thinking_ = millis();
     }
@@ -998,6 +1578,8 @@ void VaClient::set_phase_(const std::string &phase) {
         this->streaming_ = false;
         this->cancel_timeout("va_no_speech");
       }
+      if (this->request_follow_up_token_.load() != 0)
+        this->revoke_followup_("plain_idle", true);
     } else if (this->suppress_followup_) {
       // send_interrupt() set this — user explicitly asked us to stop.
       // Close the session cleanly: streaming off, no follow-up, fall through
@@ -1010,6 +1592,7 @@ void VaClient::set_phase_(const std::string &phase) {
       this->followup_armed_ = false;
       this->cancel_timeout("va_tts_tail");
       this->idle_emit_pending_ = false;
+      this->revoke_followup_("stop_idle", false);
     } else if (this->graceful_close_token_.load() != 0) {
       // The model judged this exchange complete. Keep the mic closed and defer
       // idle until the same speaker-drain path used by ordinary follow-ups.
@@ -1020,7 +1603,16 @@ void VaClient::set_phase_(const std::string &phase) {
       this->followup_armed_ = false;
       this->idle_emit_pending_ = true;
       return;
-    } else if (this->audio_fill_ == 0) {
+    } else if (this->request_follow_up_token_.load() != 0 &&
+               this->request_follow_up_pending_) {
+      // A tokenized explicit request always enters the drain path, even when
+      // the PSRAM ring is already empty by the time backend idle arrives.
+      this->streaming_ = false;
+      this->followup_pending_ = true;
+      this->waiting_for_speaker_stop_ = false;
+      this->idle_emit_pending_ = true;
+      return;
+    } else if (this->audio_fill_snapshot_() == 0) {
       // Stale-`idle` guard. prev==REPLYING with NO audio played since the last
       // wake (turn_t_first_audio_out_==0) means this `idle` belongs to a reply
       // that was stopped and then superseded by a new wake while it was still
@@ -1071,18 +1663,33 @@ void VaClient::set_phase_(const std::string &phase) {
       // Mark both pending; the drain handler in loop() releases them
       // together after the speaker actually finishes.
       ESP_LOGI(TAG, "phase=idle but %u bytes still queued; LED + follow-up deferred",
-               (unsigned) this->audio_fill_);
+               (unsigned) this->audio_fill_snapshot_());
       this->followup_pending_ = true;
       this->idle_emit_pending_ = true;
       return;  // suppress immediate trigger fire — open_followup_window_ will fire it later
     }
+    // A completed response never grants another request. This only revokes the
+    // current wake; it does not replenish the already-spent one-shot budget.
   }
 
   // set_phase_ may be called from the websocket task; ESPHome triggers and
   // most component APIs are not thread-safe. Marshal the side effects onto
   // the main loop via defer().
+  PhaseApplyResult effect_plan = transition;
+  portENTER_CRITICAL(&this->followup_mux_);
+  effect_plan.active_after = this->lifecycle_.active_wake();
+  effect_plan.connection_generation = this->lifecycle_.connection_generation();
+  effect_plan.session_nonce = this->lifecycle_.session_nonce();
+  effect_plan.wake_generation = this->lifecycle_.wake_generation();
+  effect_plan.effect_epoch = this->lifecycle_.effect_epoch();
+  portEXIT_CRITICAL(&this->followup_mux_);
   std::string phase_copy = phase;
-  this->defer([this, phase_copy]() {
+  this->defer([this, phase_copy, runtime_phase, effect_plan]() {
+    std::lock_guard<GenerationEffectGate> effect_guard(
+        this->generation_effect_gate_);
+    if (static_cast<Phase>(this->current_phase_.load()) != runtime_phase ||
+        !this->phase_effect_plan_current_(effect_plan))
+      return;
     // We deliberately do NOT call speaker->stop() on "listening" anymore:
     // the speaker task runs continuously after setup() and play() just
     // appends to its ring buffer. Stop/start churn was creating multiple
@@ -1094,115 +1701,245 @@ void VaClient::set_phase_(const std::string &phase) {
   });
 }
 
-void VaClient::start_session() {
-  if (this->enroll_mode_) {
-    ESP_LOGW(TAG, "wake ignored — enrollment mode active");
-    return;
+uint32_t VaClient::prepare_local_wake() {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  if (!this->transport_admission_.can_start_wake()) {
+    ESP_LOGW(TAG, "local wake rejected: a newly admitted backend session is required");
+    return 0;
   }
-  // Open the streaming window. on_mic_data_ will start forwarding frames to
-  // the server until "phase":"idle" comes back (response.done). Without this
-  // gate, OpenAI Realtime's server VAD would respond to any speech in the
-  // room — wake word would be cosmetic.
+  if (this->enroll_mode_ || this->microphone_is_muted_()) {
+    ESP_LOGW(TAG, "local wake rejected: enrollment or mute active");
+    return 0;
+  }
+  bool admitted = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  this->lifecycle_.set_muted(false);
+  admitted = this->lifecycle_.connected() && this->lifecycle_.authorized() &&
+             !this->lifecycle_.enrollment();
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (!admitted) {
+    ESP_LOGW(TAG, "local wake rejected: backend hello not admitted");
+    return 0;
+  }
 
-  // Belt-and-suspenders barge-in. The yaml wake handler calls send_interrupt()
-  // when it observes voice_assistant_phase == replying, but two windows slip
-  // past that check:
-  //   1) server already sent phase=idle yet PSRAM still has seconds of TTS
-  //      queued (idle_emit_pending_). yaml's voice_assistant_phase has been
-  //      reset to idle and the wake handler takes the "fresh session" path —
-  //      no interrupt — so the new reply overlaps with the tail of the old.
-  //   2) wake fires mid-reply on a long answer where the server is still
-  //      generating tokens; without an interrupt, OpenAI keeps streaming TTS
-  //      we'll never play, burning tokens.
-  // The bridge treats interrupt as cheap when there's nothing to cancel
-  // (response_cancel_not_active is in its benignCodes set), and
-  // input_audio_buffer.clear is safe here because mic frames for the new turn
-  // don't start flowing until after this function returns.
   const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
+  const size_t audio_fill = this->audio_fill_snapshot_();
   const bool residual_reply =
-      this->audio_fill_ > 0 ||
-      this->idle_emit_pending_ ||
-      phase_now == Phase::REPLYING ||
-      phase_now == Phase::THINKING;
+      !this->post_stop_guard_ &&
+      (audio_fill > 0 || this->idle_emit_pending_ || phase_now == Phase::REPLYING ||
+       phase_now == Phase::THINKING);
+  ControlContext old_context;
+
+  // Revoke every old grant and cancel every delayed opener before any network
+  // control is attempted. The replacement grant is created only afterwards.
+  if (!this->revoke_followup_("new_wake", false, false, &old_context)) {
+    ESP_LOGW(TAG, "local wake rejected: prior mic send barrier did not drain");
+    return 0;
+  }
+  bool close_sent = false;
   if (residual_reply) {
-    ESP_LOGI(TAG, "start_session: interrupting residual reply (phase=%s, fill=%u)",
-             phase_name_(phase_now), (unsigned) this->audio_fill_);
-    this->send_interrupt();
+    this->close_audio_ring_();
+    this->suppress_incoming_audio_ = true;
+    close_sent = this->send_interrupt_control_(
+        "new_wake", old_context.session_nonce, old_context.wake_generation);
+  } else {
+    close_sent = this->send_client_revoke_(
+        "new_wake", old_context.session_nonce, old_context.wake_generation);
+  }
+  if (!close_sent) {
+    ESP_LOGW(TAG, "local wake rejected: prior generation close was not delivered");
+    return 0;
   }
 
-  // Discard (do NOT replay) the pre-roll captured before this session. The ring
-  // caught the wake chime leaking through the mic during the chime/tail-delay
-  // window; replaying it fed the chime back to OpenAI as a phantom "Au!". The
-  // mic task does the actual ring reset (its sole owner) when it sees this flag.
-  this->preroll_discard_pending_ = true;
-  ESP_LOGI(TAG, "start_session() — streaming on");
-  this->streaming_ = true;
-  // Tell the backend a fresh wake started (dangling-VAD guard, A). Sent AFTER
-  // the residual-reply interrupt above so the backend sees interrupt → wake in
-  // order. The first real mic frame for this turn doesn't flow until after this
-  // returns, so the guard's "speech since wake" tracker starts clean.
-  this->send_wake_();
-  // New wake word starts a fresh session — drop any pending or active
-  // follow-up window from the previous turn.
-  this->followup_pending_ = false;
-  this->waiting_for_speaker_stop_ = false;
-  this->request_follow_up_pending_ = false;
-  this->followup_armed_ = false;
-  this->idle_emit_pending_ = false;
+  uint32_t wake_reservation = 0;
+  const bool microphone_muted = this->microphone_is_muted_();
+  portENTER_CRITICAL(&this->followup_mux_);
+  this->lifecycle_.set_muted(microphone_muted);
+  wake_reservation = this->lifecycle_.prepare_local_wake();
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (wake_reservation == 0) {
+    ESP_LOGW(TAG, "local wake rejected: no admitted backend session");
+    return 0;
+  }
+
+  this->post_stop_guard_ = false;
   this->suppress_followup_ = false;
   this->graceful_close_prepared_token_ = 0;
   this->graceful_close_token_ = 0;
-  // A genuine new turn starts here — drop the post-stop `thinking` guard so
-  // this turn's `thinking` shows normally. (Set last, AFTER the residual-reply
-  // send_interrupt() above re-set it, so the wake always ends with it clear.)
-  this->post_stop_guard_ = false;
-  this->cancel_timeout("va_followup");
-  this->cancel_timeout("va_followup_open");
-  this->cancel_timeout("va_tts_tail");
-  this->cancel_timeout("va_graceful_close");
-  // Anchor turn-latency timestamps for the new turn.
+  ESP_LOGI(TAG, "local wake pending with mic closed");
+  return wake_reservation;
+}
+
+bool VaClient::pending_wake_is_safe(uint32_t wake_reservation) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  if (!this->transport_admission_.can_start_wake())
+    return false;
+  if (this->mic_ == nullptr)
+    return false;
+  bool safe = false;
+  const bool microphone_muted = this->microphone_is_muted_();
+  portENTER_CRITICAL(&this->followup_mux_);
+  this->lifecycle_.set_muted(microphone_muted);
+  safe = this->lifecycle_.pending_wake_is_safe(wake_reservation);
+  portEXIT_CRITICAL(&this->followup_mux_);
+  return safe;
+}
+
+bool VaClient::explicit_followup_active() {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  bool active = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  active = this->lifecycle_.follow_up_stage() == FollowUpStage::OPEN &&
+           this->lifecycle_.mic_open();
+  portEXIT_CRITICAL(&this->followup_mux_);
+  return active;
+}
+
+void VaClient::abort_local_wake(uint32_t wake_reservation) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  bool aborted = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  aborted = this->lifecycle_.abort_pending_wake(wake_reservation);
+  if (aborted)
+    this->streaming_ = false;
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (!aborted)
+    return;
+  this->cancel_session_timers_();
+}
+
+bool VaClient::start_session(uint32_t wake_reservation) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  if (!this->transport_admission_.can_start_wake())
+    return false;
+  if (!this->pending_wake_is_safe(wake_reservation)) {
+    return false;
+  }
+
+  uint32_t session_nonce = 0;
+  uint32_t protocol_wake_generation = 0;
+  portENTER_CRITICAL(&this->followup_mux_);
+  session_nonce = this->lifecycle_.session_nonce();
+  protocol_wake_generation =
+      this->lifecycle_.pending_protocol_wake_generation(wake_reservation);
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (protocol_wake_generation == 0)
+    return false;
+
+  // Reservation ids are local-only. The protocol generation advances only
+  // after this exact bounded wake send succeeds.
+  if (!this->send_wake_(session_nonce, protocol_wake_generation)) {
+    this->revoke_followup_("wake_send_failed", false);
+    return false;
+  }
+
+  bool opened = false;
+  bool transmitted = false;
+  const bool microphone_muted = this->microphone_is_muted_();
+  portENTER_CRITICAL(&this->followup_mux_);
+  this->lifecycle_.set_muted(microphone_muted);
+  transmitted = this->lifecycle_.record_wake_transmitted(
+      wake_reservation, protocol_wake_generation);
+  opened = transmitted &&
+           this->lifecycle_.open_transmitted_wake(wake_reservation);
+  this->streaming_ = opened;
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (!opened) {
+    this->revoke_followup_("wake_commit_race", false);
+    if (transmitted)
+      this->send_client_revoke_("wake_commit_race", session_nonce,
+                                protocol_wake_generation);
+    return false;
+  }
+
+  this->preroll_discard_pending_ = true;
+  this->followup_pending_ = false;
+  this->waiting_for_speaker_stop_ = false;
+  this->idle_emit_pending_ = false;
+  this->cancel_session_timers_();
   this->turn_t_wake_ = millis();
   this->turn_t_listening_ = 0;
   this->turn_t_thinking_ = 0;
   this->turn_t_first_audio_out_ = 0;
-  // Reset audio-quality detectors for this turn.
   this->last_binary_ms_ = 0;
   this->ws_gap_count_ = 0;
   this->ws_gap_max_ms_ = 0;
   this->clipped_samples_ = 0;
   this->underrun_logged_this_turn_ = false;
-  // Watchdog: if server doesn't hear us within kNoSpeechTimeoutMs, abort the
-  // session so we're not stuck with the mic open after a misfire.
-  this->set_timeout("va_no_speech", kNoSpeechTimeoutMs, [this]() {
-    ESP_LOGI(TAG, "no speech detected for %u ms — aborting session",
-             (unsigned) kNoSpeechTimeoutMs);
-    if (this->ws_connected_ && this->ws_handle_ != nullptr) {
-      const char m[] = "{\"type\":\"interrupt\"}";
-      auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-      esp_websocket_client_send_text(handle, m, sizeof(m) - 1, portMAX_DELAY);
+  ESP_LOGI(TAG, "local wake committed with mic open");
+
+  this->set_timeout("va_no_speech", kNoSpeechTimeoutMs,
+                    [this, protocol_wake_generation]() {
+    std::lock_guard<GenerationEffectGate> effect_guard(
+        this->generation_effect_gate_);
+    bool close = false;
+    bool mic_was_open = false;
+    uint32_t session_nonce = 0;
+    portENTER_CRITICAL(&this->followup_mux_);
+    close = this->lifecycle_.silent_wake_timeout_matches(
+        protocol_wake_generation);
+    if (close) {
+      session_nonce = this->lifecycle_.session_nonce();
+      mic_was_open = this->lifecycle_.mic_open();
+      this->lifecycle_.revoke();
+      this->streaming_ = false;
     }
-    this->streaming_ = false;
+    portEXIT_CRITICAL(&this->followup_mux_);
+    if (!close)
+      return;
+
+    if (!this->wait_for_mic_send_barrier_(
+            "silent_wake_mic_send_barrier_failed"))
+      return;
+    ESP_LOGI(TAG, "silent wake timed out");
+    if (mic_was_open)
+      this->send_mic_flush_(session_nonce, protocol_wake_generation);
+    this->send_interrupt_control_("silent_wake", session_nonce,
+                                  protocol_wake_generation);
     this->turn_t_wake_ = 0;
-    // Force LED back to idle from yaml side.
-    this->defer([this]() {
-      for (auto *t : this->phase_triggers_) {
-        t->trigger("idle");
-      }
-    });
+    this->fire_phase_led_("idle");
   });
+
+  this->set_timeout(
+      "va_session_ceiling", kAbsoluteSessionMaxMs,
+      [this, protocol_wake_generation]() {
+        std::lock_guard<GenerationEffectGate> effect_guard(
+            this->generation_effect_gate_);
+        bool close = false;
+        bool mic_was_open = false;
+        uint32_t session_nonce = 0;
+        portENTER_CRITICAL(&this->followup_mux_);
+        close = this->lifecycle_.absolute_session_timeout_matches(
+            protocol_wake_generation);
+        if (close) {
+          session_nonce = this->lifecycle_.session_nonce();
+          mic_was_open = this->lifecycle_.mic_open();
+          this->lifecycle_.revoke();
+          this->streaming_ = false;
+        }
+        portEXIT_CRITICAL(&this->followup_mux_);
+        if (!close || !this->wait_for_mic_send_barrier_(
+                          "session_ceiling_mic_send_barrier_failed"))
+          return;
+        this->clear_request_follow_up_(false);
+        if (mic_was_open)
+          this->send_mic_flush_(session_nonce, protocol_wake_generation);
+        this->send_interrupt_control_("session_ceiling", session_nonce,
+                                      protocol_wake_generation);
+        ESP_LOGW(TAG, "absolute voice-session safety ceiling reached");
+        this->fire_phase_led_("idle");
+      });
+  return true;
 }
 
 void VaClient::open_followup_window_(uint32_t duration_ms) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
   // If a phase=idle LED transition was held back while audio drained, fire
   // it now so the LED goes to idle in sync with the speaker actually going
   // quiet (instead of as soon as the server emitted response.done).
   if (this->idle_emit_pending_) {
     this->idle_emit_pending_ = false;
-    this->defer([this]() {
-      for (auto *t : this->phase_triggers_) {
-        t->trigger("idle");
-      }
-    });
+    this->fire_phase_led_("idle");
     // Per-turn latency summary. Anchors are zero if we skipped a milestone
     // (e.g. interrupt mid-reply); show "?" so the line stays readable.
     if (this->turn_t_wake_ != 0) {
@@ -1235,63 +1972,30 @@ void VaClient::open_followup_window_(uint32_t duration_ms) {
       this->turn_t_wake_ = 0;  // mark turn as logged
     }
   }
-  if (duration_ms == 0) {
-    // Follow-up disabled for this call: turn-based behaviour like the
-    // original pipeline. Leave the mic closed; user must say a wake word
-    // for the next turn. (The LED idle was already emitted above / by the
-    // set_phase_ tail.)
-    this->streaming_ = false;
-    return;
+  // RAPID-PILOT is deliberately staged in zero mode. Legacy automatic
+  // post-reply mic timers are not authorized to open the mic at any duration;
+  // only the nonce-bound two-phase explicit path can do so.
+  this->streaming_ = false;
+  if (duration_ms != 0) {
+    ESP_LOGE(TAG, "non-zero legacy follow-up rejected in RAPID-PILOT mode");
+    this->revoke_followup_("legacy_follow_up_nonzero", true);
   }
-  // Follow-up dialog window. We do NOT open the mic immediately: has_buffered_
-  // data() (the drain signal that got us here) goes false ~500 ms before true
-  // silence — there's still the i2s ring + DAC tail playing out. Opening the
-  // mic now would let that tail leak back in (XMOS AEC ~10x) and false-trigger
-  // the server VAD. So wait followup_open_delay_ms_ (from the backend) for the
-  // tail to clear, THEN open the mic and show `listening` so the user can see
-  // the device is waiting for them to answer (without a wake word). The LED
-  // stays idle (emitted just above) during this short gap. Any new turn / wake /
-  // stop / interrupt cancels "va_followup_open" before it fires (see set_phase_,
-  // start_session, send_interrupt), so a new turn won't reopen the mic under it.
-  const uint32_t open_delay = this->followup_open_delay_ms_;
-  ESP_LOGI(TAG, "follow-up: mic opens in %u ms, then listening for %u ms",
-           (unsigned) open_delay, (unsigned) duration_ms);
-  this->set_timeout("va_followup_open", open_delay, [this, duration_ms]() {
-    if (!this->ws_connected_) {
-      // The reply drained into a dead connection (WS dropped mid-reply).
-      // Opening the mic would show a "listening" LED while on_mic_data_
-      // drops every frame — a window the user talks into for nothing.
-      // Leave the LED on idle; a fresh wake after reconnect starts clean.
-      ESP_LOGI(TAG, "follow-up window skipped — WS disconnected");
-      return;
-    }
-    ESP_LOGI(TAG, "follow-up window open (mic on, listening for %u ms)", (unsigned) duration_ms);
-    this->streaming_ = true;
-    this->fire_phase_led_("listening");  // blue ring: user may answer now
-    this->set_timeout("va_followup", duration_ms, [this]() {
-      if (this->streaming_) {
-        ESP_LOGI(TAG, "follow-up window expired — mic streaming off");
-        this->streaming_ = false;
-        this->send_mic_flush_();        // drop any uncommitted partial utterance
-        this->fire_phase_led_("idle");  // no answer came; back to idle
-      }
-    });
-  });
 }
 
 void VaClient::enroll_start() {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
   if (this->enroll_mode_)
     return;
+  if (this->microphone_is_muted_()) {
+    ESP_LOGW(TAG, "enrollment rejected while microphone is muted");
+    return;
+  }
   ESP_LOGI(TAG, "enrollment START — mic pinned open, session timers suspended");
-  this->cancel_timeout("va_no_speech");
-  this->cancel_timeout("va_followup");
-  this->cancel_timeout("va_followup_open");
-  this->cancel_timeout("va_tts_tail");
-  this->cancel_timeout("va_graceful_close");
+  if (!this->revoke_followup_("enrollment", true))
+    return;
+  this->cancel_session_timers_();
   this->followup_pending_ = false;
   this->waiting_for_speaker_stop_ = false;
-  this->request_follow_up_pending_ = false;
-  this->followup_armed_ = false;
   this->idle_emit_pending_ = false;
   this->suppress_followup_ = false;
   this->graceful_close_prepared_token_ = 0;
@@ -1301,54 +2005,95 @@ void VaClient::enroll_start() {
   this->preroll_discard_pending_ = true;
   this->enroll_mode_ = true;
   this->enroll_started_ms_ = millis();
-  this->streaming_ = true;
+  portENTER_CRITICAL(&this->followup_mux_);
+  this->lifecycle_.set_muted(false);
+  this->streaming_ = this->lifecycle_.start_enrollment();
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (!this->streaming_) {
+    this->enroll_mode_ = false;
+    portENTER_CRITICAL(&this->followup_mux_);
+    this->lifecycle_.stop_enrollment();
+    portEXIT_CRITICAL(&this->followup_mux_);
+    ESP_LOGW(TAG, "enrollment rejected: backend session is not admitted");
+    return;
+  }
   this->set_phase_("enrolling");
   // Hard cap: a forgotten/hung session must not stream the household forever.
   this->set_timeout("va_enroll_cap", kEnrollMaxMs, [this]() {
+    std::lock_guard<GenerationEffectGate> effect_guard(
+        this->generation_effect_gate_);
     ESP_LOGW(TAG, "enrollment hit the safety cap — stopping");
     this->enroll_stop(true);
   });
 }
 
 void VaClient::enroll_stop(bool notify_backend) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
   if (!this->enroll_mode_)
     return;
   ESP_LOGI(TAG, "enrollment STOP (%s) after %u s",
            notify_backend ? "device-initiated" : "backend-initiated",
            (unsigned) ((millis() - this->enroll_started_ms_) / 1000));
+  ControlContext context;
   this->cancel_timeout("va_enroll_cap");
   this->enroll_mode_ = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  context.session_nonce = this->lifecycle_.session_nonce();
+  context.wake_generation = this->lifecycle_.wake_generation();
+  this->lifecycle_.stop_enrollment();
   this->streaming_ = false;
+  portEXIT_CRITICAL(&this->followup_mux_);
+  const bool barrier_clear = this->wait_for_mic_send_barrier_(
+      "enroll_mic_send_barrier_failed");
   // Don't let the routine idle transition open a follow-up mic window — the
   // session is over, the device should go fully to rest.
   this->suppress_followup_ = true;
-  if (notify_backend && this->ws_connected_ && this->ws_handle_ != nullptr) {
-    const char m[] = "{\"type\":\"enroll_stopped\"}";
-    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, m, sizeof(m) - 1, 100 / portTICK_PERIOD_MS);
+  if (barrier_clear && notify_backend && this->legacy_zero_mode_()) {
+    if (!this->send_text_bounded_("{\"type\":\"enroll_stopped\"}",
+                                  "enroll_stopped")) {
+      this->quarantine_transport_("enroll_stopped_send_failed");
+    }
+  } else if (barrier_clear && notify_backend) {
+    // Trusted enrollment uses the same authoritative close control as every
+    // other mic owner. The backend stops enrollment on client_revoke; if the
+    // bounded send fails, quarantine closes the socket and stops it there too.
+    this->send_client_revoke_("enrollment_stopped", context.session_nonce,
+                              context.wake_generation);
   }
   this->set_phase_("idle");
 }
 
 void VaClient::send_button_cancel() {
-  if (!this->ws_connected_ || this->ws_handle_ == nullptr)
+  ControlContext context;
+  if (!this->revoke_followup_("button_cancel", false, true, &context))
     return;
-  const char m[] = "{\"type\":\"button_cancel\"}";
-  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-  esp_websocket_client_send_text(handle, m, sizeof(m) - 1, 100 / portTICK_PERIOD_MS);
-  ESP_LOGI(TAG, "button cancel sent");
+  std::string message = this->legacy_zero_mode_()
+                            ? "{\"type\":\"button_cancel\"}"
+                            : "{\"type\":\"button_cancel\",\"session_nonce\":" +
+                                  std::to_string(context.session_nonce) +
+                                  ",\"wake_generation\":" +
+                                  std::to_string(context.wake_generation) + "}";
+  if (this->send_text_bounded_(message, "button_cancel"))
+    ESP_LOGI(TAG, "button cancel sent");
 }
 
 void VaClient::send_false_flag() {
-  if (!this->ws_connected_ || this->ws_handle_ == nullptr)
+  ControlContext context;
+  if (!this->revoke_followup_("false_flag", false, true, &context))
     return;
-  const char m[] = "{\"type\":\"false_flag\"}";
-  auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-  esp_websocket_client_send_text(handle, m, sizeof(m) - 1, 100 / portTICK_PERIOD_MS);
-  ESP_LOGI(TAG, "explicit false-wake flag sent (double-press)");
+  std::string message = this->legacy_zero_mode_()
+                            ? "{\"type\":\"false_flag\"}"
+                            : "{\"type\":\"false_flag\",\"session_nonce\":" +
+                                  std::to_string(context.session_nonce) +
+                                  ",\"wake_generation\":" +
+                                  std::to_string(context.wake_generation) + "}";
+  if (this->send_text_bounded_(message, "false_flag"))
+    ESP_LOGI(TAG, "explicit false-wake flag sent (double-press)");
 }
 
-void VaClient::send_mic_flush_() {
+bool VaClient::send_mic_flush_(uint32_t session_nonce,
+                               uint32_t wake_generation) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
   // The mic gate just closed mid-stream because a follow-up window timed out.
   // If the user had started (but not finished) speaking, that audio sits
   // UNCOMMITTED in OpenAI's input_audio_buffer; left there, a later wake's
@@ -1357,95 +2102,616 @@ void VaClient::send_mic_flush_() {
   // the server VAD and caused garbage commits). This timer only fires when the
   // user did NOT trigger speech — `listening` cancels va_followup — so it can
   // never drop a valid command. Cheap no-op when the buffer was empty.
-  if (this->ws_connected_ && this->ws_handle_ != nullptr) {
-    const char msg[] = "{\"type\":\"flush\"}";
-    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
+  std::string message = this->legacy_zero_mode_()
+                            ? "{\"type\":\"flush\"}"
+                            : "{\"type\":\"flush\",\"session_nonce\":" +
+                                  std::to_string(session_nonce) +
+                                  ",\"wake_generation\":" +
+                                  std::to_string(wake_generation) + "}";
+  const bool sent = this->send_text_bounded_(message, "flush");
+  if (sent) {
     ESP_LOGI(TAG, "follow-up window closed — sent flush (drop uncommitted mic audio)");
+  } else {
+    this->quarantine_transport_("flush_send_failed");
   }
+  return sent;
 }
 
-void VaClient::send_wake_() {
+bool VaClient::send_wake_(uint32_t session_nonce,
+                          uint32_t wake_generation) {
   // Tell the backend a fresh wake started (dangling-VAD guard, A). Until the
   // user actually speaks this turn, OpenAI's server VAD can still fire an
   // end-of-turn for a PREVIOUS utterance that never closed (the reply gated the
   // mic mid-sentence) — committing it auto-creates a garbage answer to an empty
   // turn. The backend uses this signal to suppress that stale thinking + cancel
   // the racing response. Sent on every start_session(); old backends ignore it.
-  if (this->ws_connected_ && this->ws_handle_ != nullptr) {
-    const char msg[] = "{\"type\":\"wake\"}";
-    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
+  std::string message = this->legacy_zero_mode_()
+                             ? "{\"type\":\"wake\"}"
+                             : "{\"type\":\"wake\",\"session_nonce\":" +
+                                   std::to_string(session_nonce) +
+                                   ",\"wake_generation\":" +
+                                   std::to_string(wake_generation) + "}";
+  const bool sent = this->send_text_bounded_(message, "wake");
+  if (sent) {
     ESP_LOGI(TAG, "wake — sent {\"type\":\"wake\"} (dangling-VAD guard)");
   }
+  return sent;
+}
+
+bool VaClient::send_hello_ack_(uint32_t nonce, bool accepted) {
+  std::string ack = "{\"type\":\"hello_ack\",\"nonce\":" + std::to_string(nonce);
+  ack += accepted ? ",\"accepted\":true" : ",\"accepted\":false";
+  ack += ",\"audio_out\":\"pcm\",\"follow_up_ms\":" +
+         std::to_string(this->followup_ms_);
+  ack += ",\"follow_up_open_delay_ms\":" +
+         std::to_string(this->followup_open_delay_ms_);
+  ack += ",\"wake_open_delay_ms\":" + std::to_string(this->wake_open_delay_ms_);
+  ack += ",\"playback_prebuffer_ms\":" + std::to_string(this->playback_prebuffer_ms_) + "}";
+  const bool sent = this->send_text_bounded_(ack, "hello_ack");
+  if (accepted && !sent) {
+    this->session_nonce_ = 0;
+    portENTER_CRITICAL(&this->followup_mux_);
+    this->lifecycle_.reject_hello();
+    portEXIT_CRITICAL(&this->followup_mux_);
+  }
+  return sent;
+}
+
+bool VaClient::send_request_follow_up_ack_(uint32_t token, uint32_t session_nonce,
+                                           bool accepted) {
+  std::string ack = "{\"type\":\"request_follow_up_ack\",\"token\":" +
+                    std::to_string(token);
+  ack += ",\"session_nonce\":" + std::to_string(session_nonce);
+  ack += accepted ? ",\"accepted\":true}" : ",\"accepted\":false}";
+  return this->send_text_bounded_(ack, "request_follow_up_ack");
+}
+
+bool VaClient::send_cancel_request_follow_up_ack_(uint32_t token,
+                                                  uint32_t session_nonce,
+                                                  bool accepted, bool cleared) {
+  std::string ack = "{\"type\":\"cancel_request_follow_up_ack\",\"token\":" +
+                    std::to_string(token);
+  ack += ",\"session_nonce\":" + std::to_string(session_nonce);
+  ack += accepted ? ",\"accepted\":true" : ",\"accepted\":false";
+  ack += cleared ? ",\"cleared\":true}" : ",\"cleared\":false}";
+  return this->send_text_bounded_(ack, "cancel_request_follow_up_ack");
+}
+
+bool VaClient::send_follow_up_ready_(const FollowUpCredentials &credentials) {
+  std::string message = "{\"type\":\"follow_up_ready\",\"token\":" +
+                        std::to_string(credentials.token) +
+                        ",\"session_nonce\":" +
+                        std::to_string(credentials.session_nonce) +
+                        ",\"ready_nonce\":" +
+                        std::to_string(credentials.ready_nonce) + "}";
+  return this->send_text_bounded_(message, "follow_up_ready");
+}
+
+bool VaClient::send_follow_up_commit_ack_(uint32_t token, uint32_t session_nonce,
+                                          uint32_t ready_nonce, bool accepted) {
+  std::string message = "{\"type\":\"commit_follow_up_ack\",\"token\":" +
+                        std::to_string(token) + ",\"session_nonce\":" +
+                        std::to_string(session_nonce) + ",\"ready_nonce\":" +
+                        std::to_string(ready_nonce);
+  message += accepted ? ",\"accepted\":true}" : ",\"accepted\":false}";
+  return this->send_text_bounded_(message, "commit_follow_up_ack");
+}
+
+bool VaClient::send_client_revoke_(const char *reason, uint32_t session_nonce,
+                                   uint32_t wake_generation) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  if (this->legacy_zero_mode_())
+    return true;
+  std::string message = "{\"type\":\"client_revoke\",\"session_nonce\":" +
+                        std::to_string(session_nonce) +
+                        ",\"wake_generation\":" +
+                        std::to_string(wake_generation) + ",\"reason\":\"" +
+                        reason + "\"}";
+  const bool sent = this->send_text_bounded_(message, "client_revoke");
+  if (!sent)
+    this->quarantine_transport_("client_revoke_send_failed");
+  return sent;
+}
+
+bool VaClient::send_interrupt_control_(const char *reason, uint32_t session_nonce,
+                                       uint32_t wake_generation) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  std::string message = this->legacy_zero_mode_()
+                            ? "{\"type\":\"interrupt\"}"
+                            : "{\"type\":\"interrupt\",\"session_nonce\":" +
+                                  std::to_string(session_nonce) +
+                                  ",\"wake_generation\":" +
+                                  std::to_string(wake_generation) + ",\"reason\":\"" +
+                                  reason + "\"}";
+  const bool sent = this->send_text_bounded_(message, "interrupt");
+  if (!sent)
+    this->quarantine_transport_("interrupt_send_failed");
+  return sent;
+}
+
+void VaClient::clear_request_follow_up_(bool close_window) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  ControlContext context;
+  uint32_t token = 0;
+  bool lifecycle_window_was_open = false;
+  bool should_settle_idle = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  context.session_nonce = this->lifecycle_.session_nonce();
+  context.wake_generation = this->lifecycle_.wake_generation();
+  token = this->request_follow_up_token_.exchange(0);
+  lifecycle_window_was_open =
+      this->lifecycle_.follow_up_stage() == FollowUpStage::OPEN &&
+      this->lifecycle_.mic_open();
+  should_settle_idle =
+      (token != 0 || lifecycle_window_was_open) &&
+      static_cast<Phase>(this->current_phase_.load()) == Phase::IDLE;
+  if (close_window) {
+    this->lifecycle_.revoke();
+  }
+  this->request_follow_up_pending_ = false;
+  this->followup_armed_ = false;
+  this->request_follow_up_callback_in_flight_ = false;
+  this->request_follow_up_callback_token_ = 0;
+  this->request_follow_up_callback_session_nonce_ = 0;
+  this->followup_pending_ = false;
+  this->waiting_for_speaker_stop_ = false;
+  this->idle_emit_pending_ = false;
+  if (close_window)
+    this->streaming_ = false;
+  portEXIT_CRITICAL(&this->followup_mux_);
+  this->cancel_timeout("va_followup");
+  this->cancel_timeout("va_followup_open");
+  this->cancel_timeout("va_followup_commit");
+  this->cancel_timeout("va_request_follow_up_hard");
+  const bool barrier_clear =
+      !close_window ||
+      this->wait_for_mic_send_barrier_(
+          "follow_up_close_mic_send_barrier_failed");
+  if (close_window && lifecycle_window_was_open) {
+    if (barrier_clear)
+      this->send_mic_flush_(context.session_nonce, context.wake_generation);
+  }
+  if (close_window && should_settle_idle)
+    this->fire_phase_led_("idle");
+}
+
+void VaClient::cancel_session_timers_() {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  this->cancel_timeout("va_no_speech");
+  this->cancel_timeout("va_followup");
+  this->cancel_timeout("va_followup_open");
+  this->cancel_timeout("va_tts_tail");
+  this->cancel_timeout("va_graceful_close");
+  this->cancel_timeout("va_followup_commit");
+  this->cancel_timeout("va_request_follow_up_hard");
+  this->cancel_timeout("va_session_ceiling");
+}
+
+VaClient::ControlContext VaClient::control_context_() {
+  ControlContext context;
+  portENTER_CRITICAL(&this->followup_mux_);
+  context.session_nonce = this->lifecycle_.session_nonce();
+  context.wake_generation = this->lifecycle_.wake_generation();
+  context.effect_epoch = this->lifecycle_.effect_epoch();
+  portEXIT_CRITICAL(&this->followup_mux_);
+  return context;
+}
+
+bool VaClient::legacy_zero_mode_() {
+  bool legacy = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  legacy = this->lifecycle_.legacy_zero();
+  portEXIT_CRITICAL(&this->followup_mux_);
+  return legacy;
+}
+
+void VaClient::close_audio_ring_() {
+  portENTER_CRITICAL(&this->ring_mux_);
+  this->audio_head_ = 0;
+  this->audio_tail_ = 0;
+  this->audio_fill_ = 0;
+  this->playback_prebuffer_pending_ = false;
+  this->playback_priming_ = false;
+  this->prime_started_ms_ = 0;
+  this->prebuffer_generation_++;
+  portEXIT_CRITICAL(&this->ring_mux_);
+  this->chain_prime_remaining_ = 0;
+}
+
+size_t VaClient::audio_fill_snapshot_() {
+  portENTER_CRITICAL(&this->ring_mux_);
+  const size_t fill = this->audio_fill_;
+  portEXIT_CRITICAL(&this->ring_mux_);
+  return fill;
+}
+
+bool VaClient::microphone_is_muted_() {
+  return this->external_mute_.load() || this->mic_ == nullptr ||
+         this->mic_->get_mute_state();
+}
+
+bool VaClient::announcement_path_clear_() {
+  return !this->announcement_active_.load() &&
+         this->announcement_speaker_ != nullptr &&
+         !this->announcement_speaker_->has_buffered_data();
+}
+
+bool VaClient::wait_for_mic_send_barrier_(const char *failure_reason) {
+  const uint32_t started_ms = millis();
+  while (this->mic_send_fence_.in_flight() != 0 &&
+         millis() - started_ms < kMicSendBarrierTimeoutMs) {
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  const bool clear = this->mic_send_fence_.in_flight() == 0;
+  if (!clear) {
+    ESP_LOGE(TAG,
+             "mic send barrier did not drain; network close controls suppressed");
+    this->quarantine_transport_(failure_reason);
+  }
+  return clear;
+}
+
+void VaClient::quarantine_transport_(const char *reason) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  const bool first_fault =
+      this->transport_admission_.on_authoritative_close_failure();
+  this->ws_connected_ = false;
+  this->session_nonce_ = 0;
+  uint32_t fault_generation = this->ws_connection_generation_.load();
+  if (first_fault) {
+    fault_generation++;
+    if (fault_generation == 0)
+      fault_generation = 1;
+    this->ws_connection_generation_ = fault_generation;
+  }
+  this->cancel_timeout("va_enroll_cap");
+  this->enroll_mode_ = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  this->lifecycle_.on_disconnected();
+  this->streaming_ = false;
+  portEXIT_CRITICAL(&this->followup_mux_);
+  this->clear_request_follow_up_(false);
+  this->cancel_session_timers_();
+  if (!first_fault)
+    return;
+
+  ESP_LOGE(TAG, "authoritative close failed (%s); transport quarantined", reason);
+  this->defer([this, fault_generation]() {
+    bool should_stop = false;
+    esp_websocket_client_handle_t handle = nullptr;
+    {
+      std::lock_guard<GenerationEffectGate> effect_guard(
+          this->generation_effect_gate_);
+      should_stop =
+          this->ws_connection_generation_.load() == fault_generation;
+      handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
+    }
+    if (!should_stop)
+      return;
+    const esp_err_t stop_result =
+        handle == nullptr ? ESP_OK : esp_websocket_client_stop(handle);
+    esp_err_t destroy_result = ESP_FAIL;
+    if (handle != nullptr && stop_result != ESP_OK)
+      destroy_result = esp_websocket_client_destroy(handle);
+    std::lock_guard<GenerationEffectGate> effect_guard(
+        this->generation_effect_gate_);
+    if (destroy_result == ESP_OK && this->ws_handle_ == handle)
+      this->ws_handle_ = nullptr;
+    if (this->ws_connection_generation_.load() != fault_generation)
+      return;
+    if (stop_result == ESP_OK || destroy_result == ESP_OK) {
+      // A successful stop/destroy establishes the transport boundary. Mark it
+      // here as well as in the event callback so a missing callback or an
+      // already-absent handle cannot leave the next real connection unable to
+      // admit its hello.
+      this->transport_admission_.on_transport_disconnected();
+    } else {
+      ESP_LOGE(TAG, "quarantined websocket stop/destroy failed: %d/%d",
+               (int) stop_result, (int) destroy_result);
+    }
+    this->schedule_reconnect_();
+  });
+}
+
+bool VaClient::revoke_followup_(const char *reason, bool notify_backend,
+                                bool post_stop,
+                                ControlContext *closed_context) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  ControlContext context;
+  bool mic_was_open = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  context.session_nonce = this->lifecycle_.session_nonce();
+  context.wake_generation = this->lifecycle_.wake_generation();
+  mic_was_open = this->streaming_.load() || this->lifecycle_.mic_open();
+  if (post_stop)
+    this->lifecycle_.stop();
+  else
+    this->lifecycle_.revoke();
+  this->streaming_ = false;
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (closed_context != nullptr)
+    *closed_context = context;
+  const bool barrier_clear = this->wait_for_mic_send_barrier_(
+      "revoke_mic_send_barrier_failed");
+  this->clear_request_follow_up_(false);
+  this->cancel_session_timers_();
+  if (!barrier_clear) {
+    return false;
+  }
+  bool controls_sent = true;
+  if (mic_was_open)
+    controls_sent = this->send_mic_flush_(context.session_nonce,
+                                          context.wake_generation);
+  if (controls_sent && notify_backend) {
+    controls_sent = this->send_client_revoke_(
+        reason, context.session_nonce, context.wake_generation);
+  }
+  return controls_sent;
+}
+
+void VaClient::revoke_followup() {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  this->revoke_followup_("manual_revoke", true);
+}
+
+void VaClient::revoke_for_mute() {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  this->external_mute_ = true;
+  ControlContext context;
+  bool mic_was_open = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  context.session_nonce = this->lifecycle_.session_nonce();
+  context.wake_generation = this->lifecycle_.wake_generation();
+  mic_was_open = this->streaming_.load() || this->lifecycle_.mic_open();
+  this->lifecycle_.set_muted(true);
+  this->streaming_ = false;
+  portEXIT_CRITICAL(&this->followup_mux_);
+  const bool barrier_clear = this->wait_for_mic_send_barrier_(
+      "mute_mic_send_barrier_failed");
+  this->clear_request_follow_up_(false);
+  this->cancel_session_timers_();
+  if (!barrier_clear)
+    return;
+  if (barrier_clear && mic_was_open)
+    this->send_mic_flush_(context.session_nonce, context.wake_generation);
+  if (barrier_clear)
+    this->send_client_revoke_("mute", context.session_nonce,
+                              context.wake_generation);
+}
+
+void VaClient::release_mute() {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  this->external_mute_ = false;
+  const bool microphone_muted = this->microphone_is_muted_();
+  portENTER_CRITICAL(&this->followup_mux_);
+  this->lifecycle_.set_muted(microphone_muted);
+  portEXIT_CRITICAL(&this->followup_mux_);
+}
+
+void VaClient::set_announcement_active(bool active) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  this->announcement_active_ = active;
+  if (!active)
+    return;
+
+  ControlContext context;
+  bool revoke = false;
+  bool mic_was_open = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  const FollowUpStage stage = this->lifecycle_.follow_up_stage();
+  revoke = this->lifecycle_.mic_open() || stage == FollowUpStage::READY;
+  if (revoke) {
+    context.session_nonce = this->lifecycle_.session_nonce();
+    context.wake_generation = this->lifecycle_.wake_generation();
+    mic_was_open = this->lifecycle_.mic_open();
+    this->lifecycle_.revoke();
+    this->streaming_ = false;
+  }
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (!revoke)
+    return;
+
+  const bool barrier_clear = this->wait_for_mic_send_barrier_(
+      "announcement_mic_send_barrier_failed");
+  this->clear_request_follow_up_(false);
+  this->cancel_session_timers_();
+  if (!barrier_clear)
+    return;
+  if (barrier_clear && mic_was_open)
+    this->send_mic_flush_(context.session_nonce, context.wake_generation);
+  if (barrier_clear)
+    this->send_client_revoke_("announcement_started", context.session_nonce,
+                              context.wake_generation);
 }
 
 void VaClient::send_graceful_close_ack_(const char *stage, uint32_t token, bool accepted) {
   std::string ack = "{\"type\":\"suppress_followup_ack\",\"stage\":\"";
   ack += stage;
   ack += "\",\"token\":" + std::to_string(token);
+  if (!this->legacy_zero_mode_()) {
+    const ControlContext context = this->control_context_();
+    ack += ",\"session_nonce\":" + std::to_string(context.session_nonce);
+    ack += ",\"wake_generation\":" + std::to_string(context.wake_generation);
+  }
   ack += accepted ? ",\"accepted\":true}" : ",\"accepted\":false}";
-  this->defer([this, ack]() {
-    if (!this->ws_connected_ || this->ws_handle_ == nullptr)
-      return;
-    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, ack.c_str(), ack.size(), portMAX_DELAY);
-  });
+  this->send_text_bounded_(ack, "suppress_followup_ack");
 }
 
 void VaClient::fire_phase_led_(const std::string &phase) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
   // Drive the yaml on_phase automation (LED ring + voice_assistant_phase global)
   // from a device-side timer, not a server message. Marshalled via defer() so it
   // runs on the main loop even if called from another task.
+  uint32_t effect_epoch = 0;
+  portENTER_CRITICAL(&this->followup_mux_);
+  effect_epoch = this->lifecycle_.effect_epoch();
+  portEXIT_CRITICAL(&this->followup_mux_);
   std::string phase_copy = phase;
-  this->defer([this, phase_copy]() {
+  this->defer([this, phase_copy, effect_epoch]() {
+    std::lock_guard<GenerationEffectGate> effect_guard(
+        this->generation_effect_gate_);
+    bool current = false;
+    portENTER_CRITICAL(&this->followup_mux_);
+    current = this->lifecycle_.effect_epoch_matches(effect_epoch);
+    portEXIT_CRITICAL(&this->followup_mux_);
+    if (!current)
+      return;
     for (auto *t : this->phase_triggers_) {
       t->trigger(phase_copy);
     }
   });
 }
 
-void VaClient::commit_followup_mic() {
-  // Called from yaml's on_followup_opened automation once the chime has
-  // finished playing AND the i2s tail has cleared (wait_until + delay).
-  // If anything pre-empted us between trigger fire and here (a fresh
-  // wake word, a Stop, send_interrupt, or a new turn starting) the
-  // armed flag was cleared — silently no-op so we don't reopen the mic
-  // out of nowhere.
-  if (!this->followup_armed_) {
-    ESP_LOGD(TAG, "commit_followup_mic: not armed, ignoring");
-    return;
+uint32_t VaClient::generate_ready_nonce_() {
+  for (size_t attempt = 0; attempt < 16; attempt++) {
+    const uint32_t candidate = esp_random() & kProtocolTokenMax;
+    bool available = false;
+    portENTER_CRITICAL(&this->followup_mux_);
+    available = this->lifecycle_.ready_nonce_available(candidate);
+    portEXIT_CRITICAL(&this->followup_mux_);
+    if (available)
+      return candidate;
   }
-  this->followup_armed_ = false;
-  ESP_LOGI(TAG, "follow-up mic armed by yaml (window %u ms)",
-           (unsigned) kRequestFollowUpMs);
-  // Discard the pre-roll: the request_follow_up chime just played and leaked
-  // into the ring; don't replay it to OpenAI. (Same "Au!" guard as the wake
-  // path; consumed by the mic task on the next frame.)
-  this->preroll_discard_pending_ = true;
-  this->streaming_ = true;
-  this->set_timeout("va_followup", kRequestFollowUpMs, [this]() {
-    if (this->streaming_) {
-      ESP_LOGI(TAG, "follow-up window expired — mic streaming off");
-      this->streaming_ = false;
-      this->send_mic_flush_();  // drop any uncommitted partial utterance
-    }
-  });
+  return 0;
+}
+
+bool VaClient::mark_followup_ready(uint32_t token, uint32_t session_nonce) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  bool ring_empty = false;
+  portENTER_CRITICAL(&this->ring_mux_);
+  ring_empty = this->audio_fill_ == 0;
+  portEXIT_CRITICAL(&this->ring_mux_);
+
+  const bool speaker_drained =
+      this->speaker_ != nullptr && !this->speaker_->has_buffered_data();
+  const bool announcement_clear = this->announcement_path_clear_();
+  const bool microphone_ready = !this->microphone_is_muted_();
+  const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
+  const uint32_t ready_nonce = this->generate_ready_nonce_();
+  FollowUpCredentials credentials;
+  bool ready = false;
+  bool stale_callback = false;
+  bool owned_failure = false;
+
+  portENTER_CRITICAL(&this->followup_mux_);
+  credentials = this->lifecycle_.credentials();
+  const uint32_t audio_generation = this->lifecycle_.audio_generation();
+  const bool callback_matches =
+      this->request_follow_up_callback_in_flight_.load() &&
+      this->request_follow_up_callback_token_.load() == token &&
+      this->request_follow_up_callback_session_nonce_.load() == session_nonce;
+  const bool request_matches =
+      this->lifecycle_.follow_up_stage() != FollowUpStage::NONE &&
+      credentials.token == token && credentials.session_nonce == session_nonce;
+  stale_callback = !callback_matches || !request_matches;
+  const bool safe_to_ready = !stale_callback && this->followup_armed_.load() &&
+      ready_nonce != 0 &&
+      this->graceful_close_prepared_token_.load() == 0 &&
+      this->graceful_close_token_.load() == 0 &&
+      this->followup_ms_.load() == 0 && !this->barge_in_ &&
+      this->ws_connected_.load() && !this->enroll_mode_.load() &&
+      !this->streaming_.load() && phase_now == Phase::IDLE && ring_empty &&
+       speaker_drained && announcement_clear &&
+       this->mic_send_fence_.in_flight() == 0 && microphone_ready;
+  if (safe_to_ready && this->lifecycle_.mark_follow_up_ready(
+                           token, session_nonce, ready_nonce, audio_generation)) {
+    this->followup_armed_ = false;
+    this->request_follow_up_callback_in_flight_ = false;
+    this->request_follow_up_callback_token_ = 0;
+    this->request_follow_up_callback_session_nonce_ = 0;
+    credentials = this->lifecycle_.credentials();
+    ready = true;
+  } else if (!stale_callback) {
+    this->lifecycle_.revoke();
+    this->streaming_ = false;
+    this->request_follow_up_token_ = 0;
+    this->request_follow_up_pending_ = false;
+    this->followup_armed_ = false;
+    this->request_follow_up_callback_in_flight_ = false;
+    this->request_follow_up_callback_token_ = 0;
+    this->request_follow_up_callback_session_nonce_ = 0;
+    this->followup_pending_ = false;
+    this->waiting_for_speaker_stop_ = false;
+    this->idle_emit_pending_ = false;
+    owned_failure = true;
+  }
+  portEXIT_CRITICAL(&this->followup_mux_);
+
+  if (stale_callback) {
+    ESP_LOGW(TAG, "stale follow-up READY callback ignored");
+    return false;
+  }
+  this->cancel_timeout("va_followup_commit");
+  if (owned_failure || !ready) {
+    this->cancel_timeout("va_followup");
+    this->cancel_timeout("va_followup_open");
+    ESP_LOGW(TAG,
+             "follow-up READY rejected (phase=%s); "
+             "mic remains closed",
+             phase_name_(phase_now));
+    this->send_client_revoke_("ready_rejected", credentials.session_nonce,
+                              credentials.wake_generation);
+    return false;
+  }
+
+  if (!this->send_follow_up_ready_(credentials)) {
+    this->revoke_followup_("ready_send_failed", false);
+    return false;
+  }
+
+  ESP_LOGI(TAG, "follow-up READY sent with mic closed");
+  this->set_timeout(
+      "va_followup_commit", kRequestFollowUpCommitTimeoutMs,
+      [this, credentials]() {
+        std::lock_guard<GenerationEffectGate> effect_guard(
+            this->generation_effect_gate_);
+        bool matches = false;
+        portENTER_CRITICAL(&this->followup_mux_);
+        const FollowUpCredentials current = this->lifecycle_.credentials();
+        matches = this->lifecycle_.follow_up_stage() == FollowUpStage::READY &&
+                  current.token == credentials.token &&
+                  current.session_nonce == credentials.session_nonce &&
+                  current.wake_generation == credentials.wake_generation &&
+                  current.ready_nonce == credentials.ready_nonce;
+        if (matches) {
+          this->lifecycle_.revoke();
+          this->streaming_ = false;
+        }
+        portEXIT_CRITICAL(&this->followup_mux_);
+        if (!matches)
+          return;
+        ESP_LOGW(TAG, "follow-up COMMIT timed out; mic remained closed");
+        this->revoke_followup_("commit_timeout", true);
+      });
+  return true;
+}
+
+void VaClient::abort_followup_mic(uint32_t token, uint32_t session_nonce) {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  bool owns_callback_or_request = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  const FollowUpCredentials credentials = this->lifecycle_.credentials();
+  owns_callback_or_request = this->lifecycle_.follow_up_stage() != FollowUpStage::NONE &&
+                             credentials.token == token &&
+                             credentials.session_nonce == session_nonce;
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (!owns_callback_or_request)
+    return;
+  ESP_LOGI(TAG, "follow-up callback aborted");
+  this->revoke_followup_("follow_up_abort", true);
 }
 
 void VaClient::send_interrupt() {
-  // Best-effort cancel to the backend — ONLY if the socket is alive. The local
-  // cleanup below must ALWAYS run: returning early on a dead socket (the old
-  // behaviour) left streaming_ on, the PSRAM ring full and the follow-up timers
-  // armed after a "stop" on a dead link, so the mic would resume streaming the
-  // room the instant we reconnected.
-  if (this->ws_connected_ && this->ws_handle_ != nullptr) {
-    const char msg[] = "{\"type\":\"interrupt\"}";
-    auto handle = static_cast<esp_websocket_client_handle_t>(this->ws_handle_);
-    esp_websocket_client_send_text(handle, msg, sizeof(msg) - 1, portMAX_DELAY);
-  } else {
-    ESP_LOGW(TAG, "send_interrupt: WS not connected — local cleanup only");
-  }
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  ControlContext context;
+  portENTER_CRITICAL(&this->followup_mux_);
+  context.session_nonce = this->lifecycle_.session_nonce();
+  context.wake_generation = this->lifecycle_.wake_generation();
+  this->lifecycle_.stop();
+  this->streaming_ = false;
+  portEXIT_CRITICAL(&this->followup_mux_);
+  const bool barrier_clear = this->wait_for_mic_send_barrier_(
+      "stop_mic_send_barrier_failed");
   // Flush our PSRAM playback queue — what's already been pushed into the
   // resampler/mixer/leaf will still drain (~600 ms residual), but everything
   // we have yet to hand off is dropped. The yaml side stops the resampler
@@ -1454,35 +2720,20 @@ void VaClient::send_interrupt() {
   // happen under the mux: the WS task could be mid-write and seeing
   // head=tail=fill=0 partway through would let it write into a "freshly
   // empty" buffer the user just barge-cancelled.
-  portENTER_CRITICAL(&this->ring_mux_);
-  this->audio_head_ = 0;
-  this->audio_tail_ = 0;
-  this->audio_fill_ = 0;
-  this->playback_prebuffer_pending_ = false;
-  this->playback_priming_ = false;
-  this->prime_started_ms_ = 0;
-  portEXIT_CRITICAL(&this->ring_mux_);
+  this->close_audio_ring_();
   // Drop further incoming TTS until the backend confirms the turn boundary —
   // it keeps streaming the rest of the (already-generated) reply otherwise.
   this->suppress_incoming_audio_ = true;
-  // Abandon any in-progress cold-start silence-prime; the next reply will detect
-  // cold and re-prime cleanly.
-  this->chain_prime_remaining_ = 0;
   // Close the mic gate. An interrupt during the OPEN follow-up window would
   // otherwise leave streaming_ true while the va_followup close-timer gets
   // cancelled just below — mic open + streaming to OpenAI indefinitely, so any
   // later room speech becomes an unprompted turn. Callers that start a fresh
   // turn (start_session) re-open it themselves right after.
-  this->streaming_ = false;
+  this->clear_request_follow_up_(false);
   this->followup_pending_ = false;
   this->waiting_for_speaker_stop_ = false;
-  this->request_follow_up_pending_ = false;
-  this->followup_armed_ = false;
   this->idle_emit_pending_ = false;
-  this->cancel_timeout("va_no_speech");
-  this->cancel_timeout("va_followup");
-  this->cancel_timeout("va_tts_tail");
-  this->cancel_timeout("va_graceful_close");
+  this->cancel_session_timers_();
   // The phase=idle the server is about to send shouldn't open a follow-up
   // mic window — the user said "stop", not "wait for me to keep talking".
   this->suppress_followup_ = true;
@@ -1493,8 +2744,10 @@ void VaClient::send_interrupt() {
   // end-of-turn for the utterance we just cancelled, not a real new turn.
   // Cleared in start_session() (the next wake). See set_phase_.
   this->post_stop_guard_ = true;
-  this->cancel_timeout("va_followup_open");
-  ESP_LOGI(TAG, "send_interrupt — WS msg sent, queue flushed");
+  if (barrier_clear)
+    this->send_interrupt_control_("stop", context.session_nonce,
+                                  context.wake_generation);
+  ESP_LOGI(TAG, "send_interrupt — local state closed before bounded control send");
 }
 
 }  // namespace va_client

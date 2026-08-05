@@ -11,6 +11,7 @@ DEPENDENCIES = ["network", "microphone", "speaker"]
 CONF_MICROPHONE = "microphone"
 CONF_MIC_CHANNEL = "mic_channel"
 CONF_SPEAKER = "speaker"
+CONF_ANNOUNCEMENT_SPEAKER = "announcement_speaker"
 CONF_BARGE_IN = "barge_in"
 CONF_ON_PHASE = "on_phase"
 CONF_ON_REPEATED_FAILURE = "on_repeated_failure"
@@ -25,7 +26,7 @@ OnRepeatedFailureTrigger = va_client_ns.class_(
     "OnRepeatedFailureTrigger", automation.Trigger.template()
 )
 OnFollowupOpenedTrigger = va_client_ns.class_(
-    "OnFollowupOpenedTrigger", automation.Trigger.template()
+    "OnFollowupOpenedTrigger", automation.Trigger.template(cg.uint32, cg.uint32)
 )
 
 CONFIG_SCHEMA = cv.Schema(
@@ -36,6 +37,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_MIC_CHANNEL, default=0): cv.int_range(min=0, max=1),
         cv.Optional(CONF_BARGE_IN, default=True): cv.boolean,
         cv.Required(CONF_SPEAKER): cv.use_id(speaker.Speaker),
+        cv.Required(CONF_ANNOUNCEMENT_SPEAKER): cv.use_id(speaker.Speaker),
         cv.Optional(CONF_ON_PHASE): automation.validate_automation(
             {
                 cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(OnPhaseTrigger),
@@ -75,6 +77,9 @@ async def to_code(config):
     spk = await cg.get_variable(config[CONF_SPEAKER])
     cg.add(var.set_speaker(spk))
 
+    announcement_spk = await cg.get_variable(config[CONF_ANNOUNCEMENT_SPEAKER])
+    cg.add(var.set_announcement_speaker(announcement_spk))
+
     for conf in config.get(CONF_ON_PHASE, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
         await automation.build_automation(trigger, [(cg.std_string, "phase")], conf)
@@ -85,4 +90,8 @@ async def to_code(config):
 
     for conf in config.get(CONF_ON_FOLLOWUP_OPENED, []):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
-        await automation.build_automation(trigger, [], conf)
+        await automation.build_automation(
+            trigger,
+            [(cg.uint32, "token"), (cg.uint32, "session_nonce")],
+            conf,
+        )

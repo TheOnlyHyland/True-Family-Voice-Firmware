@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+VERSION=1.7.12
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+
+case "$(uname -m)" in
+  x86_64)
+    archive=actionlint_1.7.12_linux_amd64.tar.gz
+    expected=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    ;;
+  aarch64|arm64)
+    archive=actionlint_1.7.12_linux_arm64.tar.gz
+    expected=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
+    ;;
+  *)
+    printf '%s\n' "unsupported actionlint architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+url="https://github.com/rhysd/actionlint/releases/download/v$VERSION/$archive"
+curl -fsSL --retry 3 "$url" -o "$TMP/$archive"
+actual=$(sha256sum "$TMP/$archive")
+actual=${actual%% *}
+if [ "$actual" != "$expected" ]; then
+  printf '%s\n' "actionlint archive checksum mismatch" >&2
+  exit 1
+fi
+tar -xzf "$TMP/$archive" -C "$TMP"
+"$TMP/actionlint" -version | grep -Fxq "$VERSION"
+"$TMP/actionlint" -shellcheck= -pyflakes= "$ROOT/.github/workflows"/*.yml
