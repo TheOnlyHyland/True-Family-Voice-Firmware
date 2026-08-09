@@ -160,6 +160,9 @@ class VaClient : public Component {
   uint32_t generate_ready_nonce_();
   bool microphone_is_muted_();
   bool announcement_path_clear_();
+  bool expire_follow_up_deadline_(uint32_t now_ms,
+                                  uint32_t expected_wake_generation,
+                                  uint32_t expected_token);
   bool wait_for_mic_send_barrier_(const char *failure_reason);
   void quarantine_transport_(const char *reason);
 
@@ -246,8 +249,9 @@ class VaClient : public Component {
   // gemini_proxy's ring_buffer_->reset() on start. Trade-off: a word spoken
   // *during* the chime is lost; the user speaks once the listening ring lights.
   // Touched ONLY by the mic task (on_mic_data_) — no lock needed.
-  // preroll_discard_pending_ is set by start_session() or final follow-up COMMIT
-  // (main loop) and consumed by the mic task through an atomic handoff.
+  // preroll_discard_pending_ is set by start_session() or a successful
+  // follow-up COMMIT (main loop) and consumed by the mic task through an atomic
+  // handoff.
   static constexpr uint32_t kMicSampleRate = 16000;  // i2s_mics rate (16 samples/ms)
   static constexpr uint32_t kPreRollMs = 600;
   int16_t *preroll_buf_{nullptr};
@@ -276,16 +280,16 @@ class VaClient : public Component {
   // post-reply path. The former wants a longer mic window
   // (kRequestFollowUpMs); legacy automatic follow-up is hard-disabled.
   std::atomic_bool request_follow_up_pending_{false};
-  // One bounded backend-issued transaction token owns the complete explicit
-  // follow-up lifecycle: pending reply drain, yaml chime, and open mic window.
+  // One fresh backend-issued transaction token owns each serialized explicit
+  // follow-up round: pending reply drain, yaml chime, and open mic window.
   std::atomic_uint32_t request_follow_up_token_{0};
   // The callback itself carries token and nonce. These fields ensure only the
   // currently in-flight callback can commit or abort its aperture.
   std::atomic_bool request_follow_up_callback_in_flight_{false};
   std::atomic_uint32_t request_follow_up_callback_token_{0};
   std::atomic_uint32_t request_follow_up_callback_session_nonce_{0};
-  // Serializes the compound token/armed/window/streaming transition shared by
-  // the websocket cancellation path and the main-loop YAML callback.
+  // Protects lifecycle and mic-lease snapshots that remain atomic after the
+  // generation-effect gate is released for a bounded send.
   portMUX_TYPE followup_mux_ = portMUX_INITIALIZER_UNLOCKED;
   FollowUpLifecycle lifecycle_;
   // Set when on_followup_opened has fired and we're waiting on yaml to

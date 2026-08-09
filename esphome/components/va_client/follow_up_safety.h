@@ -19,8 +19,97 @@ static constexpr uint32_t kRequestFollowUpReadyTimeoutMs = 8000;
 static constexpr uint32_t kAbsoluteSessionMaxMs = 120000;
 static constexpr uint32_t kMicSendBarrierTimeoutMs = 50;
 static constexpr uint32_t kFollowupOpenDelayMaxMs = 5000;
+static constexpr size_t kFollowUpReplayHistorySize = 256;
 static constexpr size_t kWsTextMessageMaxBytes = 2048;
 static constexpr size_t kWsBinaryMessageMaxBytes = 64 * 1024;
+
+enum class FollowUpPhaseCredentialDecision : uint8_t {
+  BASE = 0,
+  CURRENT,
+  STALE,
+  REJECT,
+};
+
+inline FollowUpPhaseCredentialDecision decide_follow_up_phase_credential(
+    bool follow_up_open, bool terminal_idle, bool token_present,
+    uint32_t token, uint32_t current_token) {
+  // Idle is the tokenless ownership terminator, never OPEN progression.
+  if (terminal_idle)
+    return token_present ? FollowUpPhaseCredentialDecision::REJECT
+                         : FollowUpPhaseCredentialDecision::BASE;
+  if (!token_present)
+    return follow_up_open ? FollowUpPhaseCredentialDecision::REJECT
+                          : FollowUpPhaseCredentialDecision::BASE;
+  if (token == 0 || token > kProtocolTokenMax)
+    return FollowUpPhaseCredentialDecision::REJECT;
+  if (!follow_up_open)
+    return FollowUpPhaseCredentialDecision::STALE;
+  if (current_token == 0 || current_token > kProtocolTokenMax)
+    return FollowUpPhaseCredentialDecision::REJECT;
+  return token == current_token ? FollowUpPhaseCredentialDecision::CURRENT
+                                : FollowUpPhaseCredentialDecision::STALE;
+}
+
+enum class FollowUpDeadlineAction : uint8_t {
+  NONE = 0,
+  SCHEDULE,
+  EXPIRE,
+};
+
+struct FollowUpRuntimeSnapshot {
+  bool follow_up_open{false};
+  bool deadline_armed{false};
+  uint32_t deadline_ms{0};
+  uint32_t wake_generation{0};
+  uint32_t token{0};
+  bool mic_open{false};
+  bool streaming{false};
+};
+
+struct FollowUpRuntimeDecision {
+  FollowUpDeadlineAction deadline_action{FollowUpDeadlineAction::NONE};
+  uint32_t timer_delay_ms{0};
+  bool expected_owner{false};
+  bool mic_send_allowed{false};
+};
+
+inline bool monotonic_deadline_reached(uint32_t now_ms,
+                                       uint32_t deadline_ms) {
+  return now_ms - deadline_ms < 0x80000000U;
+}
+
+inline FollowUpRuntimeDecision decide_follow_up_runtime(
+    const FollowUpRuntimeSnapshot &snapshot, uint32_t now_ms,
+    uint32_t expected_wake_generation, uint32_t expected_token) {
+  FollowUpRuntimeDecision decision;
+  const bool current_owner = snapshot.wake_generation != 0 &&
+                             snapshot.wake_generation <= kProtocolTokenMax &&
+                             snapshot.token != 0 &&
+                             snapshot.token <= kProtocolTokenMax;
+  decision.expected_owner =
+      current_owner &&
+      (expected_wake_generation == 0 ||
+       expected_wake_generation == snapshot.wake_generation) &&
+      (expected_token == 0 || expected_token == snapshot.token);
+
+  if (snapshot.follow_up_open && snapshot.deadline_armed &&
+      decision.expected_owner) {
+    if (monotonic_deadline_reached(now_ms, snapshot.deadline_ms)) {
+      decision.deadline_action = FollowUpDeadlineAction::EXPIRE;
+    } else {
+      decision.deadline_action = FollowUpDeadlineAction::SCHEDULE;
+      decision.timer_delay_ms = snapshot.deadline_ms - now_ms;
+    }
+  }
+
+  const bool follow_up_mic_safe =
+      !snapshot.follow_up_open ||
+      (snapshot.deadline_armed && decision.expected_owner &&
+       decision.deadline_action == FollowUpDeadlineAction::SCHEDULE);
+  decision.mic_send_allowed = snapshot.mic_open && snapshot.streaming &&
+                              follow_up_mic_safe;
+  return decision;
+}
 
 // Serializes generation validation with every resulting timer/mic side effect.
 // It is recursive because effect helpers compose while retaining one ownership
@@ -455,7 +544,7 @@ struct FollowUpAdmissionContext {
   bool message_shape_valid{false};
   bool token_replayed_or_history_full{true};
   bool physical_wake_active{false};
-  bool one_shot_consumed{true};
+  bool per_answer_grant_available{false};
   bool replying{false};
   bool closed_single_turn{false};
   bool connected{false};
@@ -472,8 +561,10 @@ inline bool should_accept_follow_up(const FollowUpAdmissionContext &context) {
          context.request_session_nonce != 0 && context.request_session_nonce <= kProtocolTokenMax &&
          context.token != context.request_session_nonce &&
          context.request_session_nonce == context.active_session_nonce &&
-         !context.token_replayed_or_history_full && context.physical_wake_active &&
-         !context.one_shot_consumed && context.replying && context.closed_single_turn && context.connected &&
+         !context.token_replayed_or_history_full &&
+         context.physical_wake_active &&
+         context.per_answer_grant_available && context.replying &&
+         context.closed_single_turn && context.connected &&
          !context.microphone_muted && !context.microphone_streaming && !context.enrollment_active &&
          !context.competing_control_active && !context.active_request && !context.callback_in_flight;
 }

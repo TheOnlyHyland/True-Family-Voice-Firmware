@@ -29,7 +29,7 @@ class ReleasePackageTest(unittest.TestCase):
         )
         (package / "SHA256SUMS").write_text(sums, encoding="ascii")
 
-    def make_package(self, root: Path, version: str = "0.19.0") -> Path:
+    def make_package(self, root: Path, version: str = "0.20.0") -> Path:
         package = root / version
         package.mkdir()
         factory = package / f"{BASE}.factory.bin"
@@ -87,7 +87,7 @@ class ReleasePackageTest(unittest.TestCase):
             [
                 "python3",
                 str(MAKE_INTENT),
-                "0.19.0",
+                "0.20.0",
                 SOURCE_COMMIT,
                 SOURCE_TREE,
                 "true",
@@ -105,7 +105,7 @@ class ReleasePackageTest(unittest.TestCase):
             [
                 "python3",
                 str(VERIFY_INTENT),
-                "0.19.0",
+                "0.20.0",
                 SOURCE_COMMIT,
                 SOURCE_TREE,
                 "true",
@@ -120,11 +120,11 @@ class ReleasePackageTest(unittest.TestCase):
     def test_accepts_exact_package_and_rejects_byte_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             package = self.make_package(Path(temp))
-            accepted = self.verify("0.19.0", package)
+            accepted = self.verify("0.20.0", package)
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
             (package / f"{BASE}.ota.bin").write_bytes(b"different")
-            rejected = self.verify("0.19.0", package)
+            rejected = self.verify("0.20.0", package)
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("SHA-256 mismatch", rejected.stderr)
 
@@ -132,12 +132,12 @@ class ReleasePackageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             package = self.make_package(Path(temp))
             (package / "unexpected.bin").write_bytes(b"unexpected")
-            extra = self.verify("0.19.0", package)
+            extra = self.verify("0.20.0", package)
             self.assertNotEqual(extra.returncode, 0)
             self.assertIn("file set mismatch", extra.stderr)
 
             (package / "unexpected.bin").unlink()
-            wrong_version = self.verify("0.19.1", package)
+            wrong_version = self.verify("0.20.1", package)
             self.assertNotEqual(wrong_version.returncode, 0)
             self.assertIn("manifest version", wrong_version.stderr)
 
@@ -160,7 +160,7 @@ class ReleasePackageTest(unittest.TestCase):
                     mutation(manifest)
                     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
                     self.refresh_sums(package)
-                    rejected = self.verify("0.19.0", package)
+                    rejected = self.verify("0.20.0", package)
                     self.assertNotEqual(rejected.returncode, 0)
                     self.assertIn(expected_error, rejected.stderr)
 
@@ -174,7 +174,7 @@ class ReleasePackageTest(unittest.TestCase):
             verified = self.verify_intent(destination)
             self.assertEqual(verified.returncode, 0, verified.stderr)
 
-            copied_ota = destination / "package" / "0.19.0" / f"{BASE}.ota.bin"
+            copied_ota = destination / "package" / "0.20.0" / f"{BASE}.ota.bin"
             copied_ota.write_bytes(b"changed after preparation")
             rejected = self.verify_intent(destination)
             self.assertNotEqual(rejected.returncode, 0)
@@ -192,7 +192,7 @@ class ReleasePackageTest(unittest.TestCase):
                 [
                     "python3",
                     str(VERIFY_INTENT),
-                    "0.19.0",
+                    "0.20.0",
                     "c" * 40,
                     SOURCE_TREE,
                     "true",

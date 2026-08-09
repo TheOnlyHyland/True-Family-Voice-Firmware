@@ -22,7 +22,7 @@ You don't build anything by hand for a normal install — the per-device stub
 [`esphome-builder.static-ip.yaml`](esphome-builder.static-ip.yaml)) pulls
 [`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml) from
 this repo at an immutable release tag, and ESPHome Builder compiles and flashes
-it. A stub pinned to `0.19.0` does not auto-discover later releases. Updating is
+it. A stub pinned to `0.20.0` does not auto-discover later releases. Updating is
 deliberate: review a release, advance both pinned refs in the local stub to that
 exact tag and compile, or deliberately re-adopt the newer release's pinned stub.
 To hack on the firmware itself, point the stub's `packages:` block at your
@@ -82,12 +82,13 @@ The tracked layering is deliberate:
 
 ## Follow-up protocol compatibility
 
-Firmware `0.19.0` is firmware-first compatible with backend `0.20.6`: a legacy
-nonce-less hello keeps ordinary single-turn voice operation working, but cannot
-authorize explicit no-wake follow-up. Backend `0.21.0` must send a nonce-bearing
-hello and require the matching `hello_ack`; that requirement rejects firmware
-`0.18.0` and older before any protected control is sent. See
-[`CHANGELOG.md`](CHANGELOG.md) for the deployment order.
+Firmware `0.20.0` keeps ordinary physical-wake turns compatible with backend
+`0.20.6` and backend `0.21.x`. Backend `0.20.6` cannot authorize explicit
+no-wake follow-up. Backend `0.21.x` uses tokenless trusted phases, so every
+explicit follow-up OPEN answer fails closed at its first `listening`, `thinking`,
+or `replying` progression phase. Coordinated backend `0.22.0` is required for
+any explicit follow-up. See [`CHANGELOG.md`](CHANGELOG.md) for the deployment
+order.
 
 ### Exact hello schemas
 
@@ -108,8 +109,8 @@ single-turn wake/audio operation only. Automatic and explicit no-wake follow-up
 remain disabled, and legacy `wake`, `ack`, `interrupt`, and `flush` retain their
 nonce-less schemas.
 
-Backend `0.21.0` trusted mode sends the same exact object plus a positive,
-CSPRNG-generated 31-bit `nonce`:
+Backend `0.21.x` and `0.22.0` trusted mode send the same exact object plus a
+positive, CSPRNG-generated 31-bit `nonce`:
 
 ```json
 {"type":"hello","nonce":123456789,"audio_out":"pcm","follow_up_ms":0,"follow_up_open_delay_ms":800,"wake_open_delay_ms":700,"playback_prebuffer_ms":120}
@@ -121,22 +122,29 @@ Firmware answers with this exact key set:
 {"type":"hello_ack","nonce":123456789,"accepted":true,"audio_out":"pcm","follow_up_ms":0,"follow_up_open_delay_ms":800,"wake_open_delay_ms":700,"playback_prebuffer_ms":120}
 ```
 
-Backend `0.21.0` must compare the nonce, acceptance, audio mode, zero-mode value,
-and all three echoed timing values before sending any protected control. A
-missing, rejected, failed, or mismatched ACK must fail the connection closed.
+Trusted backends must compare the nonce, acceptance, audio mode, zero-mode
+value, and all three echoed timing values before sending any protected control.
+A missing, rejected, failed, or mismatched ACK must fail the connection closed.
 The most recent nonce may recover after reconnect only with identical tuning
-values. An older nonce replay is rejected. Session, follow-up-token, and
-ready-nonce histories each hold 256 values and fail closed when full.
+values. An older nonce replay is rejected. Session-nonce history holds 256
+values and fails closed when full. Follow-up tokens and READY nonces each use a
+separate fixed 256-value, non-evicting history for the admitted session. History
+exhaustion rejects PREPARE and revokes the current wake rather than forgetting
+an older credential. Reconnect recovery preserves those histories; a fresh hello
+starts empty histories without retaining dynamically allocated capacity.
 
 ### Two-phase explicit follow-up
 
 All tokens and nonces below are positive signed 31-bit integers. Objects use
-exact key sets.
+exact key sets. This flow requires coordinated backend `0.22.0`; backend
+`0.21.x` cannot complete even the first explicit OPEN answer because its
+progression phases omit `T`.
 
 1. During the reply belonging to a current physical wake, backend sends
    `{"type":"request_follow_up","token":T,"session_nonce":S}`.
-2. Firmware atomically spends that wake's one-shot grant, closes the mic, and
-   sends `{"type":"request_follow_up_ack","token":T,"session_nonce":S,"accepted":true}`.
+2. Firmware atomically spends the current answer's single PREPARE grant, closes
+   the mic, and sends
+   `{"type":"request_follow_up_ack","token":T,"session_nonce":S,"accepted":true}`.
    This is PREPARE only; it never authorizes backend audio consumption.
 3. After a bound backend `phase=idle`, the PCM ring and TTS speaker chain drain.
    Firmware runs the optional chime and the negotiated
@@ -153,17 +161,30 @@ exact key sets.
    ownership, token/nonces, audio generation, empty PCM ring, drained TTS
    speaker, and inactive/drained announcement speaker before opening the mic.
    An announcement beginning after READY revokes the transaction.
-7. The aperture closes after an absolute 10 seconds, including time after the
-   backend reports speech. Mute, Stop, disconnect, new local wake, late audio,
-   malformed or competing control, failed/partial send, cancellation, and every
-   stale timer close locally first and cannot reopen it. A separate
+7. Successful COMMIT stores an absolute opening deadline 10 seconds later. The
+   lifecycle, main loop, mic lease path, trusted phase path, and cooperative
+   timer all check that same deadline, including after the backend reports
+   speech. A delayed timer callback therefore cannot extend the aperture or
+   admit late `thinking`, `replying`, or grant rearm. Mute, Stop, disconnect, new
+   local wake, late audio, malformed or competing control, failed/partial send,
+   cancellation, and timeout close locally first and cannot reopen it. A separate
    generation-bound 120-second whole-session ceiling remains armed across ACK,
    PCM, reply, PREPARE, READY, and OPEN until authoritative session closure.
+8. Only a bound `OPEN -> listening -> thinking -> replying` transition that
+   includes genuine answer speech and the exact current `T` on every progression
+   phase creates exactly one PREPARE grant for the next answer. PREPARE consumes
+   that grant. Denial, cancellation, timeout, malformed control, stale ownership,
+   missing or stale round credentials, or any other fail-closed path creates
+   none. Serialized rounds retain the original physical `wake_generation` and
+   its original 120-second ceiling. The fixed 256-round replay bound is far above
+   what that operational ceiling permits; reaching it still fails closed.
 
 Backend must not emit `phase=listening` or consume a continuation before the
-accepted final COMMIT ACK. It must also honor a later bound `client_revoke`,
-`interrupt`, or `flush`; a race discovered by the firmware's post-ACK recheck
-can cancel the transaction while keeping the mic closed.
+accepted final COMMIT ACK. After that ACK, its `listening`, `thinking`, and
+`replying` messages for the OPEN round must echo the same `token=T`. It must also
+honor a later bound `client_revoke`, `interrupt`, or `flush`; a race discovered
+by the firmware's post-ACK recheck can cancel the transaction while keeping the
+mic closed.
 
 Backend cancellation is
 `{"type":"cancel_request_follow_up","token":T,"session_nonce":S}`; firmware
@@ -174,27 +195,45 @@ in trusted mode are exactly
 controls carry the current `session_nonce` and `wake_generation`; `interrupt`
 and `client_revoke` also carry a firmware-defined `reason` string.
 
-Trusted backend phases are exact, ownership-bound objects:
+Trusted physical-wake phases and terminal `idle` remain exact,
+ownership-bound objects:
 
 ```json
 {"type":"phase","value":"listening","session_nonce":S,"wake_generation":G}
 ```
 
-The same exact key set applies to `thinking`, `replying`, and `idle`. A stale,
-same-session wake generation is a harmless no-op so delayed traffic cannot
-close a newer wake. Missing, extra, unknown, or foreign-session phase data fails
-closed. Legacy backend `0.20.6` keeps the exact unbound shape
-`{"type":"phase","value":"listening"}`.
+The same base key set applies to the physical wake's `thinking`, `replying`, and
+`idle`, and to the terminal `idle` after an explicit round. Terminal `idle` is
+always tokenless; any tokenized `idle`, including one carrying the current or an
+older `T`, is invalid and fails the current wake closed. While a follow-up is
+OPEN, only its progression phases use one additional key:
+
+```json
+{"type":"phase","value":"listening","session_nonce":S,"wake_generation":G,"token":T}
+```
+
+The token-bound shape applies only to OPEN `listening`, `thinking`, and
+`replying`. The exact current transaction token is required; a well-formed token
+from an older round is a harmless no-op, while a missing, zero, malformed, or
+extra credential fails the OPEN round closed. A stale same-session wake
+generation is also a harmless no-op so delayed progression traffic cannot close
+a newer wake. Unknown or foreign-session phase data fails closed. Legacy backend
+`0.20.6` keeps the exact unbound shape
+`{"type":"phase","value":"listening"}` and ordinary single-turn operation.
+Backend `0.21.x` likewise retains ordinary trusted physical-wake turns, but its
+tokenless OPEN phases make every explicit follow-up fail closed. Backend `0.22.0`
+is required before any explicit follow-up is enabled.
 
 Trusted `phase=thinking` is the strict single-turn endpoint: firmware closes
 the mic gate, invalidates its send epoch, waits for the bounded send barrier,
 and rejects all further PCM for that turn. The same physical wake generation,
 120-second budget, and response ownership remain active through `replying`, so
-the model may send one `request_follow_up` during that reply. Terminal `idle`
-closes the wake unless PREPARE/READY already owns it. For an explicit follow-up,
-`OPEN -> thinking -> replying -> idle` closes input at `thinking`, retains the
-response owner through `replying`, consumes no additional wake generation, and
-closes authoritatively at `idle`.
+the model may spend that answer's one `request_follow_up` grant during its reply.
+Terminal `idle` closes the wake unless PREPARE/READY already owns it. For an
+explicit follow-up, `OPEN -> listening -> thinking -> replying -> idle` closes
+input at `thinking`, retains the response owner through `replying`, consumes no
+additional wake generation, rearms one next-round grant only after trusted
+answer speech, and closes authoritatively at `idle` when no next PREPARE owns it.
 
 Incoming WebSocket events are reassembled before dispatch. Text controls are
 limited to 2048 bytes and binary PCM messages to 64 KiB. Frame offsets, opcode,
@@ -269,15 +308,19 @@ This remains a RAPID-PILOT LAN protocol over plaintext `ws://`. The nonce,
 generation, and token checks bind state transitions and reject stale/replayed
 controls, but they do not authenticate the peer or provide confidentiality or
 integrity against an active LAN attacker. There is deliberately no HMAC, PSK,
-certificate pinning, or provisioning flow in firmware `0.19.0`.
+certificate pinning, or provisioning flow in firmware `0.20.0`.
 
 The generic factory image contains neither ESPHome native API nor native OTA,
 so there is no unauthenticated native management interval. Secure adoption uses
 a one-time local USB install of a per-device stub with an encrypted API key and
-private OTA password; see [`INSTALL.md`](INSTALL.md). The verification gate
-proves host state transitions, resolved build inputs, source identity, and
-compilation, but does not replace a physical-device/backend interoperability
-test.
+private OTA password; see [`INSTALL.md`](INSTALL.md). Dependency-free host tests
+execute the same phase-credential, deadline/timer, mic-lease, lifecycle, and
+generation-effect decisions used by `VaClient`. They cannot execute ESP-IDF's
+`portMUX`, ESPHome's cooperative timer dispatcher, or the real mic/WebSocket task
+interleaving. Source checks retain only those integration boundaries; release
+acceptance still requires an ESPHome compile and HIL exercise of delayed timer,
+PREPARE-versus-mic, tokenized-idle, and mic-barrier races. Neither host testing
+nor compilation replaces physical-device/backend interoperability testing.
 
 ---
 *Based on / inspired by xandervanerven's and maxmaxme's Voice PE work and the

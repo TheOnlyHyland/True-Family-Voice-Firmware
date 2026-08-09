@@ -5,30 +5,39 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 using esphome::va_client::FlatJsonObject;
+using esphome::va_client::FollowUpDeadlineAction;
 using esphome::va_client::FollowUpLifecycle;
+using esphome::va_client::FollowUpPhaseCredentialDecision;
+using esphome::va_client::FollowUpRuntimeSnapshot;
 using esphome::va_client::FollowUpStage;
 using esphome::va_client::GenerationEffectGate;
 using esphome::va_client::HelloAdmission;
 using esphome::va_client::MicSendFence;
 using esphome::va_client::PhaseApplyResult;
 using esphome::va_client::PhaseApplyStatus;
+using esphome::va_client::PhaseRuntimeAction;
 using esphome::va_client::PilotPhase;
 using esphome::va_client::TransportAdmissionGate;
 using esphome::va_client::WsMessageReassembler;
 using esphome::va_client::WsMessageType;
 using esphome::va_client::WsReassemblyStatus;
 using esphome::va_client::kAbsoluteSessionMaxMs;
+using esphome::va_client::kFollowUpReplayHistorySize;
 using esphome::va_client::kFollowupOpenDelayMaxMs;
 using esphome::va_client::kProtocolTokenMax;
 using esphome::va_client::kRequestFollowUpReadyTimeoutMs;
 using esphome::va_client::kRequestFollowUpMs;
 using esphome::va_client::kWsBinaryMessageMaxBytes;
+using esphome::va_client::decide_follow_up_phase_credential;
+using esphome::va_client::decide_follow_up_runtime;
+using esphome::va_client::phase_runtime_action;
 
 static uint32_t start_trusted_wake(FollowUpLifecycle &lifecycle, uint32_t session_nonce) {
   lifecycle.on_connected();
@@ -39,6 +48,24 @@ static uint32_t start_trusted_wake(FollowUpLifecycle &lifecycle, uint32_t sessio
   assert(lifecycle.commit_local_wake(wake_reservation));
   assert(lifecycle.mic_open());
   return lifecycle.wake_generation();
+}
+
+static PhaseApplyResult apply_initial_phase(
+    FollowUpLifecycle &lifecycle, PilotPhase phase, uint32_t session_nonce,
+    uint32_t wake_generation, bool microphone_muted = false,
+    uint32_t now_ms = 0) {
+  return lifecycle.apply_trusted_phase(
+      phase, session_nonce, wake_generation, microphone_muted, false, 0,
+      now_ms);
+}
+
+static PhaseApplyResult apply_follow_up_phase(
+    FollowUpLifecycle &lifecycle, PilotPhase phase, uint32_t session_nonce,
+    uint32_t wake_generation, uint32_t token, uint32_t now_ms,
+    bool microphone_muted = false) {
+  return lifecycle.apply_trusted_phase(
+      phase, session_nonce, wake_generation, microphone_muted, true, token,
+      now_ms);
 }
 
 static void test_strict_flat_json() {
@@ -104,6 +131,119 @@ static void test_strict_flat_json() {
   assert(message.has_exact(
       {"type", "value", "session_nonce", "wake_generation"}));
   assert(!message.has_exact({"type", "value"}));
+
+  assert(message.parse(
+      "{\"type\":\"phase\",\"value\":\"thinking\","
+      "\"session_nonce\":17,\"wake_generation\":2,\"token\":19}"));
+  assert(message.has_exact(
+      {"type", "value", "session_nonce", "wake_generation", "token"}));
+  assert(message.get_uint("token", token) && token == 19);
+}
+
+static void test_follow_up_phase_credential_contract() {
+  constexpr uint32_t kCurrentToken = 41;
+  constexpr uint32_t kOldToken = 40;
+  assert(phase_runtime_action(PhaseApplyStatus::APPLIED) ==
+         PhaseRuntimeAction::APPLY);
+  assert(phase_runtime_action(PhaseApplyStatus::STALE) ==
+         PhaseRuntimeAction::IGNORE);
+  assert(phase_runtime_action(PhaseApplyStatus::EXPIRED) ==
+         PhaseRuntimeAction::EXPIRE);
+  assert(phase_runtime_action(PhaseApplyStatus::REJECTED) ==
+         PhaseRuntimeAction::REVOKE);
+  assert(decide_follow_up_phase_credential(
+             false, false, false, 0, 0) ==
+         FollowUpPhaseCredentialDecision::BASE);
+  assert(decide_follow_up_phase_credential(
+             true, false, true, kCurrentToken, kCurrentToken) ==
+         FollowUpPhaseCredentialDecision::CURRENT);
+  assert(decide_follow_up_phase_credential(
+             true, false, true, kOldToken, kCurrentToken) ==
+         FollowUpPhaseCredentialDecision::STALE);
+  assert(decide_follow_up_phase_credential(
+             true, false, false, 0, kCurrentToken) ==
+         FollowUpPhaseCredentialDecision::REJECT);
+  assert(decide_follow_up_phase_credential(
+             false, false, true, kOldToken, 0) ==
+         FollowUpPhaseCredentialDecision::STALE);
+  assert(decide_follow_up_phase_credential(
+             false, false, true, 0, 0) ==
+         FollowUpPhaseCredentialDecision::REJECT);
+
+  // Idle is always the tokenless terminal shape, including while OPEN.
+  for (const bool follow_up_open : std::array<bool, 2>{false, true}) {
+    assert(decide_follow_up_phase_credential(
+               follow_up_open, true, false, 0, kCurrentToken) ==
+           FollowUpPhaseCredentialDecision::BASE);
+    for (const uint32_t token :
+         std::array<uint32_t, 3>{0U, kOldToken, kCurrentToken}) {
+      assert(decide_follow_up_phase_credential(
+                 follow_up_open, true, true, token, kCurrentToken) ==
+             FollowUpPhaseCredentialDecision::REJECT);
+    }
+  }
+}
+
+static void test_runtime_deadline_and_mic_decisions() {
+  FollowUpRuntimeSnapshot physical;
+  physical.mic_open = true;
+  physical.streaming = true;
+  auto decision = decide_follow_up_runtime(physical, 500, 0, 0);
+  assert(decision.deadline_action == FollowUpDeadlineAction::NONE);
+  assert(decision.mic_send_allowed);
+
+  FollowUpRuntimeSnapshot open;
+  open.follow_up_open = true;
+  open.deadline_armed = true;
+  open.deadline_ms = 11000;
+  open.wake_generation = 7;
+  open.token = 41;
+  open.mic_open = true;
+  open.streaming = true;
+
+  decision = decide_follow_up_runtime(open, 1000, 7, 41);
+  assert(decision.expected_owner);
+  assert(decision.deadline_action == FollowUpDeadlineAction::SCHEDULE);
+  assert(decision.timer_delay_ms == kRequestFollowUpMs);
+  assert(decision.mic_send_allowed);
+
+  decision = decide_follow_up_runtime(open, 10999, 0, 0);
+  assert(decision.deadline_action == FollowUpDeadlineAction::SCHEDULE);
+  assert(decision.timer_delay_ms == 1);
+  assert(decision.mic_send_allowed);
+
+  decision = decide_follow_up_runtime(open, 11000, 0, 0);
+  assert(decision.deadline_action == FollowUpDeadlineAction::EXPIRE);
+  assert(decision.timer_delay_ms == 0);
+  assert(!decision.mic_send_allowed);
+
+  // A timer from an older round cannot expire or send through the current one.
+  decision = decide_follow_up_runtime(open, 11000, 7, 40);
+  assert(!decision.expected_owner);
+  assert(decision.deadline_action == FollowUpDeadlineAction::NONE);
+  assert(!decision.mic_send_allowed);
+
+  open.deadline_armed = false;
+  decision = decide_follow_up_runtime(open, 1000, 0, 0);
+  assert(decision.deadline_action == FollowUpDeadlineAction::NONE);
+  assert(!decision.mic_send_allowed);
+
+  open.deadline_armed = true;
+  open.token = 0;
+  decision = decide_follow_up_runtime(open, 1000, 0, 0);
+  assert(!decision.expected_owner);
+  assert(decision.deadline_action == FollowUpDeadlineAction::NONE);
+  assert(!decision.mic_send_allowed);
+
+  open.token = 41;
+  open.deadline_ms = std::numeric_limits<uint32_t>::max() - 5;
+  decision = decide_follow_up_runtime(
+      open, std::numeric_limits<uint32_t>::max() - 6, 7, 41);
+  assert(decision.deadline_action == FollowUpDeadlineAction::SCHEDULE);
+  assert(decision.timer_delay_ms == 1);
+  decision = decide_follow_up_runtime(
+      open, std::numeric_limits<uint32_t>::max() - 5, 7, 41);
+  assert(decision.deadline_action == FollowUpDeadlineAction::EXPIRE);
 }
 
 static void test_listening_requires_owned_open_mic() {
@@ -135,7 +275,7 @@ static void test_complete_two_phase_lifecycle() {
   assert(!lifecycle.mic_open());
 
   assert(lifecycle.prepare_follow_up(9001, 7001));
-  assert(lifecycle.one_shot_spent());
+  assert(!lifecycle.per_answer_grant_available());
   assert(lifecycle.follow_up_stage() == FollowUpStage::PREPARED);
   lifecycle.on_phase_idle();
   assert(lifecycle.active_wake());
@@ -143,11 +283,22 @@ static void test_complete_two_phase_lifecycle() {
   assert(lifecycle.follow_up_stage() == FollowUpStage::READY);
   assert(!lifecycle.mic_open());
   assert(lifecycle.commit_is_safe(9001, 7001, 11001, 4));
-  assert(lifecycle.open_follow_up_after_commit(9001, 7001, 11001, 4));
+  constexpr uint32_t kOpenedAtMs = 1000;
+  assert(lifecycle.open_follow_up_after_commit(
+      9001, 7001, 11001, 4, kOpenedAtMs));
   assert(lifecycle.mic_open());
-  assert(lifecycle.hard_timeout_matches(wake_generation, 11001));
-  assert(lifecycle.on_phase_listening());
-  lifecycle.on_phase_replying();
+  assert(lifecycle.follow_up_deadline_remaining_ms(kOpenedAtMs) ==
+         kRequestFollowUpMs);
+  assert(apply_follow_up_phase(
+             lifecycle, PilotPhase::LISTENING, 7001, wake_generation, 9001,
+             kOpenedAtMs + 1)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(lifecycle.follow_up_deadline_remaining_ms(kOpenedAtMs + 1) ==
+         kRequestFollowUpMs - 1);
+  assert(apply_follow_up_phase(
+             lifecycle, PilotPhase::REPLYING, 7001, wake_generation, 9001,
+             kOpenedAtMs + 2)
+             .status == PhaseApplyStatus::APPLIED);
   lifecycle.on_phase_idle();
   assert(!lifecycle.active_wake());
   assert(!lifecycle.mic_open());
@@ -162,7 +313,8 @@ static void test_commit_races_fail_closed() {
   assert(lifecycle.mark_follow_up_ready(9002, 7002, 11002, 8));
   assert(lifecycle.commit_is_safe(9002, 7002, 11002, 8));
   lifecycle.set_muted(true);
-  assert(!lifecycle.open_follow_up_after_commit(9002, 7002, 11002, 8));
+  assert(!lifecycle.open_follow_up_after_commit(
+      9002, 7002, 11002, 8, 1000));
   assert(!lifecycle.mic_open());
 
   lifecycle.set_muted(false);
@@ -197,7 +349,8 @@ static void test_prepare_and_ready_revocations_never_reopen() {
   stopped.on_phase_idle();
   assert(stopped.mark_follow_up_ready(7201, 7200, 7202, 0));
   stopped.stop();
-  assert(!stopped.open_follow_up_after_commit(7201, 7200, 7202, 0));
+  assert(!stopped.open_follow_up_after_commit(
+      7201, 7200, 7202, 0, 1000));
   assert(!stopped.mic_open());
 
   FollowUpLifecycle disconnected;
@@ -207,7 +360,8 @@ static void test_prepare_and_ready_revocations_never_reopen() {
   disconnected.on_phase_idle();
   assert(disconnected.mark_follow_up_ready(7301, 7300, 7302, 0));
   disconnected.on_disconnected();
-  assert(!disconnected.open_follow_up_after_commit(7301, 7300, 7302, 0));
+  assert(!disconnected.open_follow_up_after_commit(
+      7301, 7300, 7302, 0, 1000));
   assert(!disconnected.mic_open());
 
   FollowUpLifecycle replaced;
@@ -218,7 +372,8 @@ static void test_prepare_and_ready_revocations_never_reopen() {
   assert(replaced.mark_follow_up_ready(7401, 7400, 7402, 0));
   const uint32_t replacement_wake = replaced.prepare_local_wake();
   assert(replacement_wake != 0);
-  assert(!replaced.open_follow_up_after_commit(7401, 7400, 7402, 0));
+  assert(!replaced.open_follow_up_after_commit(
+      7401, 7400, 7402, 0, 1000));
   assert(!replaced.mic_open());
 }
 
@@ -286,7 +441,7 @@ static void test_delayed_wake_abort_stop_and_enrollment() {
   assert(!lifecycle.mic_open());
 }
 
-static void test_replay_and_bounded_histories() {
+static void test_replay_and_bounded_session_history() {
   FollowUpLifecycle lifecycle;
   start_trusted_wake(lifecycle, 8001);
   lifecycle.on_phase_replying();
@@ -310,22 +465,335 @@ static void test_replay_and_bounded_histories() {
     assert(bounded_sessions.admit_trusted_hello(nonce) == HelloAdmission::FRESH);
   }
   assert(bounded_sessions.admit_trusted_hello(257) == HelloAdmission::REJECTED);
+}
 
-  FollowUpLifecycle bounded_tokens;
-  start_trusted_wake(bounded_tokens, 9000);
-  for (uint32_t index = 1; index <= 256; index++) {
-    bounded_tokens.on_phase_replying();
-    assert(bounded_tokens.prepare_follow_up(20000 + index, 9000));
-    bounded_tokens.revoke();
-    if (index != 256) {
-      const uint32_t wake = bounded_tokens.prepare_local_wake();
-      assert(bounded_tokens.commit_local_wake(wake));
-    }
+static void complete_serialized_follow_up_round(
+    FollowUpLifecycle &lifecycle, uint32_t session_nonce, uint32_t token,
+    uint32_t ready_nonce, uint32_t wake_generation) {
+  const uint32_t opened_at_ms = token;
+  assert(lifecycle.per_answer_grant_available());
+  assert(lifecycle.prepare_follow_up(token, session_nonce));
+  assert(!lifecycle.per_answer_grant_available());
+  lifecycle.on_phase_idle();
+  assert(lifecycle.mark_follow_up_ready(token, session_nonce, ready_nonce, 0));
+  assert(lifecycle.open_follow_up_after_commit(token, session_nonce,
+                                                 ready_nonce, 0,
+                                                 opened_at_ms));
+  assert(lifecycle.wake_generation() == wake_generation);
+  assert(lifecycle.absolute_session_timeout_matches(wake_generation));
+  assert(!lifecycle.follow_up_deadline_reached(opened_at_ms));
+  assert(apply_follow_up_phase(
+             lifecycle, PilotPhase::LISTENING, session_nonce,
+             wake_generation, token, opened_at_ms + 1)
+             .status == PhaseApplyStatus::APPLIED);
+  // Genuine speech does not turn the aperture deadline into an inactivity timer.
+  assert(lifecycle.follow_up_deadline_remaining_ms(opened_at_ms + 1) ==
+         kRequestFollowUpMs - 1);
+  assert(!lifecycle.per_answer_grant_available());
+  assert(apply_follow_up_phase(
+             lifecycle, PilotPhase::THINKING, session_nonce, wake_generation,
+             token, opened_at_ms + 2)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(!lifecycle.per_answer_grant_available());
+  assert(apply_follow_up_phase(
+             lifecycle, PilotPhase::REPLYING, session_nonce, wake_generation,
+             token, opened_at_ms + 3)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(lifecycle.follow_up_stage() == FollowUpStage::NONE);
+  assert(lifecycle.per_answer_grant_available());
+  assert(lifecycle.wake_generation() == wake_generation);
+  assert(lifecycle.absolute_session_timeout_matches(wake_generation));
+}
+
+static void test_bounded_serialized_round_history_fails_closed_and_resets() {
+  constexpr uint32_t kSessionNonce = 9000;
+  FollowUpLifecycle lifecycle;
+  const uint32_t wake_generation = start_trusted_wake(lifecycle, kSessionNonce);
+  assert(lifecycle.on_phase_listening());
+  assert(lifecycle.on_phase_thinking());
+  assert(lifecycle.on_phase_replying());
+
+  for (uint32_t round = 1; round <= kFollowUpReplayHistorySize; round++) {
+    complete_serialized_follow_up_round(
+        lifecycle, kSessionNonce, 20000 + round, 30000 + round,
+        wake_generation);
   }
-  const uint32_t exhausted_wake = bounded_tokens.prepare_local_wake();
-  assert(bounded_tokens.commit_local_wake(exhausted_wake));
-  bounded_tokens.on_phase_replying();
-  assert(!bounded_tokens.prepare_follow_up(30000, 9000));
+
+  assert(lifecycle.follow_up_token_history_count() ==
+         kFollowUpReplayHistorySize);
+  assert(lifecycle.ready_nonce_history_count() ==
+         kFollowUpReplayHistorySize);
+  assert(!lifecycle.ready_nonce_available(40000));
+  assert(!lifecycle.prepare_follow_up(40001, kSessionNonce));
+  assert(!lifecycle.active_wake());
+  assert(!lifecycle.per_answer_grant_available());
+
+  // A genuinely fresh hello owns a new replay domain and resets the fixed
+  // stores without retaining dynamic capacity from the exhausted session.
+  constexpr uint32_t kFreshSessionNonce = 9001;
+  const uint32_t fresh_wake = start_trusted_wake(lifecycle, kFreshSessionNonce);
+  assert(lifecycle.follow_up_token_history_count() == 0);
+  assert(lifecycle.ready_nonce_history_count() == 0);
+  assert(lifecycle.on_phase_listening());
+  assert(lifecycle.on_phase_thinking());
+  assert(lifecycle.on_phase_replying());
+  complete_serialized_follow_up_round(
+      lifecycle, kFreshSessionNonce, 20001, 30001, fresh_wake);
+}
+
+static void test_stale_prior_round_phase_credentials_cannot_progress_open() {
+  constexpr uint32_t kSessionNonce = 9010;
+  constexpr uint32_t kOldToken = 21001;
+  constexpr uint32_t kCurrentToken = 21002;
+  FollowUpLifecycle lifecycle;
+  const uint32_t wake_generation =
+      start_trusted_wake(lifecycle, kSessionNonce);
+  assert(lifecycle.on_phase_listening());
+  assert(lifecycle.on_phase_thinking());
+  assert(lifecycle.on_phase_replying());
+  complete_serialized_follow_up_round(
+      lifecycle, kSessionNonce, kOldToken, 31001, wake_generation);
+
+  assert(lifecycle.prepare_follow_up(kCurrentToken, kSessionNonce));
+  lifecycle.on_phase_idle();
+  assert(lifecycle.mark_follow_up_ready(
+      kCurrentToken, kSessionNonce, 31002, 0));
+  constexpr uint32_t kOpenedAtMs = 5000;
+  assert(lifecycle.open_follow_up_after_commit(
+      kCurrentToken, kSessionNonce, 31002, 0, kOpenedAtMs));
+
+  const auto missing = apply_initial_phase(
+      lifecycle, PilotPhase::LISTENING, kSessionNonce, wake_generation, false,
+      kOpenedAtMs + 1);
+  assert(missing.status == PhaseApplyStatus::REJECTED);
+  assert(lifecycle.phase() == PilotPhase::WAITING);
+  assert(lifecycle.mic_open());
+
+  const std::array<PilotPhase, 3> delayed_targets = {
+      PilotPhase::LISTENING,
+      PilotPhase::THINKING,
+      PilotPhase::REPLYING,
+  };
+  for (const PilotPhase target : delayed_targets) {
+    const auto stale = apply_follow_up_phase(
+        lifecycle, target, kSessionNonce, wake_generation, kOldToken,
+        kOpenedAtMs + 2, true);
+    assert(stale.status == PhaseApplyStatus::STALE);
+    assert(lifecycle.phase() == PilotPhase::WAITING);
+    assert(lifecycle.mic_open());
+    assert(!lifecycle.muted());
+    assert(!lifecycle.per_answer_grant_available());
+    assert(lifecycle.credentials().token == kCurrentToken);
+  }
+
+  assert(apply_follow_up_phase(
+             lifecycle, PilotPhase::LISTENING, kSessionNonce,
+             wake_generation, kCurrentToken, kOpenedAtMs + 3)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(apply_follow_up_phase(
+             lifecycle, PilotPhase::THINKING, kSessionNonce,
+             wake_generation, kCurrentToken, kOpenedAtMs + 4)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(apply_follow_up_phase(
+             lifecycle, PilotPhase::REPLYING, kSessionNonce,
+             wake_generation, kCurrentToken, kOpenedAtMs + 5)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(lifecycle.per_answer_grant_available());
+}
+
+static void test_tokenized_idle_is_invalid_and_tokenless_idle_is_terminal() {
+  constexpr uint32_t kSessionNonce = 9011;
+  constexpr uint32_t kToken = 21101;
+  FollowUpLifecycle lifecycle;
+  const uint32_t wake_generation =
+      start_trusted_wake(lifecycle, kSessionNonce);
+
+  auto result = apply_follow_up_phase(
+      lifecycle, PilotPhase::IDLE, kSessionNonce, wake_generation, kToken, 1);
+  assert(result.status == PhaseApplyStatus::REJECTED);
+  assert(phase_runtime_action(result.status) == PhaseRuntimeAction::REVOKE);
+  assert(lifecycle.active_wake());
+
+  assert(lifecycle.on_phase_replying());
+  assert(lifecycle.prepare_follow_up(kToken, kSessionNonce));
+  lifecycle.on_phase_idle();
+  assert(lifecycle.mark_follow_up_ready(
+      kToken, kSessionNonce, 31101, 0));
+  assert(lifecycle.open_follow_up_after_commit(
+      kToken, kSessionNonce, 31101, 0, 1000));
+
+  // Backend 0.21.x sends tokenless progression and therefore cannot complete
+  // any explicit OPEN answer with firmware 0.20.0.
+  for (const PilotPhase target : std::array<PilotPhase, 3>{
+           PilotPhase::LISTENING,
+           PilotPhase::THINKING,
+           PilotPhase::REPLYING,
+       }) {
+    result = apply_initial_phase(
+        lifecycle, target, kSessionNonce, wake_generation, false, 1001);
+    assert(result.status == PhaseApplyStatus::REJECTED);
+    assert(phase_runtime_action(result.status) == PhaseRuntimeAction::REVOKE);
+    assert(lifecycle.mic_open());
+  }
+
+  for (const uint32_t token :
+       std::array<uint32_t, 3>{0U, kToken - 1, kToken}) {
+    result = apply_follow_up_phase(
+        lifecycle, PilotPhase::IDLE, kSessionNonce, wake_generation, token,
+        1002);
+    assert(result.status == PhaseApplyStatus::REJECTED);
+    assert(phase_runtime_action(result.status) == PhaseRuntimeAction::REVOKE);
+    assert(lifecycle.mic_open());
+  }
+
+  result = apply_initial_phase(
+      lifecycle, PilotPhase::IDLE, kSessionNonce, wake_generation, false,
+      1003);
+  assert(result.status == PhaseApplyStatus::APPLIED);
+  assert(phase_runtime_action(result.status) == PhaseRuntimeAction::APPLY);
+  assert(!lifecycle.active_wake());
+  assert(!lifecycle.mic_open());
+}
+
+static void test_commit_deadline_is_absolute_and_wrap_safe() {
+  FollowUpLifecycle late_thinking;
+  const uint32_t thinking_wake = start_trusted_wake(late_thinking, 9020);
+  assert(late_thinking.on_phase_replying());
+  assert(late_thinking.prepare_follow_up(22001, 9020));
+  late_thinking.on_phase_idle();
+  assert(late_thinking.mark_follow_up_ready(22001, 9020, 32001, 0));
+  assert(late_thinking.open_follow_up_after_commit(
+      22001, 9020, 32001, 0, 1000));
+  assert(apply_follow_up_phase(
+             late_thinking, PilotPhase::LISTENING, 9020, thinking_wake,
+             22001, 10999)
+             .status == PhaseApplyStatus::APPLIED);
+  const auto expired_thinking = apply_follow_up_phase(
+      late_thinking, PilotPhase::THINKING, 9020, thinking_wake, 22001,
+      11000);
+  assert(expired_thinking.status == PhaseApplyStatus::EXPIRED);
+  MicSendFence fence;
+  const uint32_t lease_epoch = late_thinking.mic_epoch();
+  fence.acquire();
+  assert(late_thinking.expire_follow_up_deadline(
+      11000, thinking_wake, 22001));
+  assert(!late_thinking.mic_open());
+  assert(!late_thinking.active_wake());
+  assert(!MicSendFence::lease_is_current(
+      lease_epoch, late_thinking.mic_epoch(), late_thinking.mic_open()));
+  assert(fence.in_flight() == 1);
+  fence.release();
+  assert(fence.in_flight() == 0);
+
+  FollowUpLifecycle late_replying;
+  const uint32_t replying_wake = start_trusted_wake(late_replying, 9021);
+  assert(late_replying.on_phase_replying());
+  assert(late_replying.prepare_follow_up(22002, 9021));
+  late_replying.on_phase_idle();
+  assert(late_replying.mark_follow_up_ready(22002, 9021, 32002, 0));
+  assert(late_replying.open_follow_up_after_commit(
+      22002, 9021, 32002, 0, 2000));
+  assert(apply_follow_up_phase(
+             late_replying, PilotPhase::LISTENING, 9021, replying_wake,
+             22002, 2001)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(apply_follow_up_phase(
+             late_replying, PilotPhase::THINKING, 9021, replying_wake,
+             22002, 2002)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(!late_replying.mic_open());
+  assert(apply_follow_up_phase(
+             late_replying, PilotPhase::REPLYING, 9021, replying_wake,
+             22002, 12000)
+             .status == PhaseApplyStatus::EXPIRED);
+  assert(!late_replying.per_answer_grant_available());
+  assert(late_replying.expire_follow_up_deadline(
+      12000, replying_wake, 22002));
+  assert(!late_replying.active_wake());
+
+  FollowUpLifecycle wrapped;
+  const uint32_t wrapped_wake = start_trusted_wake(wrapped, 9022);
+  assert(wrapped.on_phase_replying());
+  assert(wrapped.prepare_follow_up(22003, 9022));
+  wrapped.on_phase_idle();
+  assert(wrapped.mark_follow_up_ready(22003, 9022, 32003, 0));
+  constexpr uint32_t kWrappedOpen =
+      std::numeric_limits<uint32_t>::max() - 5000;
+  assert(wrapped.open_follow_up_after_commit(
+      22003, 9022, 32003, 0, kWrappedOpen));
+  assert(!wrapped.follow_up_deadline_reached(kWrappedOpen + 9999));
+  assert(wrapped.follow_up_deadline_reached(kWrappedOpen + 10000));
+  assert(!wrapped.expire_follow_up_deadline(
+      kWrappedOpen + 10000, wrapped_wake, 22002));
+  assert(wrapped.mic_open());
+  assert(wrapped.expire_follow_up_deadline(
+      kWrappedOpen + 15000, wrapped_wake, 22003));
+  assert(!wrapped.mic_open());
+}
+
+static void test_only_ordered_answer_speech_rearms_a_round() {
+  FollowUpLifecycle no_speech;
+  const uint32_t no_speech_wake = start_trusted_wake(no_speech, 9050);
+  assert(no_speech.on_phase_replying());
+  assert(no_speech.prepare_follow_up(9051, 9050));
+  no_speech.on_phase_idle();
+  assert(no_speech.mark_follow_up_ready(9051, 9050, 9052, 0));
+  assert(no_speech.open_follow_up_after_commit(
+      9051, 9050, 9052, 0, 1000));
+  assert(apply_follow_up_phase(
+             no_speech, PilotPhase::THINKING, 9050, no_speech_wake, 9051,
+             1001)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(apply_follow_up_phase(
+             no_speech, PilotPhase::REPLYING, 9050, no_speech_wake, 9051,
+             1002)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(!no_speech.per_answer_grant_available());
+
+  FollowUpLifecycle no_endpoint;
+  const uint32_t no_endpoint_wake = start_trusted_wake(no_endpoint, 9060);
+  assert(no_endpoint.on_phase_replying());
+  assert(no_endpoint.prepare_follow_up(9061, 9060));
+  no_endpoint.on_phase_idle();
+  assert(no_endpoint.mark_follow_up_ready(9061, 9060, 9062, 0));
+  assert(no_endpoint.open_follow_up_after_commit(
+      9061, 9060, 9062, 0, 1000));
+  assert(apply_follow_up_phase(
+             no_endpoint, PilotPhase::LISTENING, 9060, no_endpoint_wake,
+             9061, 1001)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(apply_follow_up_phase(
+             no_endpoint, PilotPhase::REPLYING, 9060, no_endpoint_wake,
+             9061, 1002)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(!no_endpoint.per_answer_grant_available());
+
+  FollowUpLifecycle cancelled;
+  start_trusted_wake(cancelled, 9070);
+  assert(cancelled.on_phase_replying());
+  assert(cancelled.prepare_follow_up(9071, 9070));
+  cancelled.revoke();
+  assert(!cancelled.per_answer_grant_available());
+
+  FollowUpLifecycle denied;
+  start_trusted_wake(denied, 9080);
+  assert(denied.on_phase_replying());
+  assert(!denied.prepare_follow_up(9080, 9080));
+  assert(!denied.active_wake());
+  assert(!denied.per_answer_grant_available());
+
+  FollowUpLifecycle timed_out;
+  const uint32_t timed_out_wake = start_trusted_wake(timed_out, 9090);
+  assert(timed_out.on_phase_replying());
+  assert(timed_out.prepare_follow_up(9091, 9090));
+  timed_out.on_phase_idle();
+  assert(timed_out.mark_follow_up_ready(9091, 9090, 9092, 0));
+  assert(timed_out.open_follow_up_after_commit(
+      9091, 9090, 9092, 0, 1000));
+  assert(timed_out.follow_up_deadline_reached(11000));
+  assert(timed_out.expire_follow_up_deadline(
+      11000, timed_out_wake, 9091));
+  assert(!timed_out.per_answer_grant_available());
 }
 
 static void test_ready_nonce_replay_and_mismatch() {
@@ -412,7 +880,8 @@ static void test_absolute_session_ceiling_survives_progress() {
   assert(lifecycle.prepare_follow_up(7601, 7600));
   lifecycle.on_phase_idle();
   assert(lifecycle.mark_follow_up_ready(7601, 7600, 7602, 0));
-  assert(lifecycle.open_follow_up_after_commit(7601, 7600, 7602, 0));
+  assert(lifecycle.open_follow_up_after_commit(
+      7601, 7600, 7602, 0, 1000));
   assert(lifecycle.absolute_session_timeout_matches(wake_generation));
   lifecycle.revoke();
   assert(!lifecycle.absolute_session_timeout_matches(wake_generation));
@@ -461,41 +930,45 @@ static void test_announcement_start_after_ready_fails_closed() {
   assert(lifecycle.commit_is_safe(7901, 7900, 7902, 0, true));
   assert(!lifecycle.commit_is_safe(7901, 7900, 7902, 0, false));
   assert(!lifecycle.open_follow_up_after_commit(
-      7901, 7900, 7902, 0, false));
+      7901, 7900, 7902, 0, 1000, false));
   assert(!lifecycle.mic_open());
 }
 
 static void test_trusted_single_turn_endpoint_preserves_response_owner() {
   FollowUpLifecycle lifecycle;
   const uint32_t wake_generation = start_trusted_wake(lifecycle, 8100);
-  assert(lifecycle.one_shot_spent() == false);
+  assert(lifecycle.per_answer_grant_available());
 
-  auto result = lifecycle.apply_trusted_phase(
+  auto result = apply_initial_phase(
+      lifecycle,
       PilotPhase::LISTENING, 8100, wake_generation, false);
   assert(result.status == PhaseApplyStatus::APPLIED);
   assert(!result.mic_closed);
   assert(lifecycle.mic_open());
 
   const uint32_t listening_mic_epoch = lifecycle.mic_epoch();
-  result = lifecycle.apply_trusted_phase(
+  result = apply_initial_phase(
+      lifecycle,
       PilotPhase::THINKING, 8100, wake_generation, false);
   assert(result.status == PhaseApplyStatus::APPLIED);
   assert(result.mic_closed);
   assert(!lifecycle.mic_open());
   assert(lifecycle.active_wake());
   assert(lifecycle.wake_generation() == wake_generation);
-  assert(!lifecycle.one_shot_spent());
+  assert(lifecycle.per_answer_grant_available());
   assert(!MicSendFence::lease_is_current(
       listening_mic_epoch, lifecycle.mic_epoch(), lifecycle.mic_open()));
 
-  result = lifecycle.apply_trusted_phase(
+  result = apply_initial_phase(
+      lifecycle,
       PilotPhase::REPLYING, 8100, wake_generation, false);
   assert(result.status == PhaseApplyStatus::APPLIED);
   assert(lifecycle.active_wake());
   assert(lifecycle.prepare_follow_up(8101, 8100));
   assert(lifecycle.credentials().wake_generation == wake_generation);
 
-  result = lifecycle.apply_trusted_phase(
+  result = apply_initial_phase(
+      lifecycle,
       PilotPhase::IDLE, 8100, wake_generation, false);
   assert(result.status == PhaseApplyStatus::APPLIED);
   assert(result.active_after);
@@ -509,10 +982,16 @@ static void test_open_follow_up_ends_input_but_keeps_owner_until_idle() {
   assert(lifecycle.prepare_follow_up(8201, 8200));
   lifecycle.on_phase_idle();
   assert(lifecycle.mark_follow_up_ready(8201, 8200, 8202, 0));
-  assert(lifecycle.open_follow_up_after_commit(8201, 8200, 8202, 0));
+  assert(lifecycle.open_follow_up_after_commit(
+      8201, 8200, 8202, 0, 1000));
 
-  auto result = lifecycle.apply_trusted_phase(
-      PilotPhase::THINKING, 8200, wake_generation, false);
+  auto result = apply_follow_up_phase(
+      lifecycle, PilotPhase::LISTENING, 8200, wake_generation, 8201, 1001);
+  assert(result.status == PhaseApplyStatus::APPLIED);
+  assert(!result.mic_closed);
+
+  result = apply_follow_up_phase(
+      lifecycle, PilotPhase::THINKING, 8200, wake_generation, 8201, 1002);
   assert(result.status == PhaseApplyStatus::APPLIED);
   assert(result.mic_closed);
   assert(result.follow_up_input_ended);
@@ -525,15 +1004,16 @@ static void test_open_follow_up_ends_input_but_keeps_owner_until_idle() {
   assert(lifecycle.active_wake());
   assert(lifecycle.follow_up_stage() == FollowUpStage::OPEN);
 
-  result = lifecycle.apply_trusted_phase(
-      PilotPhase::REPLYING, 8200, wake_generation, false);
+  result = apply_follow_up_phase(
+      lifecycle, PilotPhase::REPLYING, 8200, wake_generation, 8201, 1003);
   assert(result.status == PhaseApplyStatus::APPLIED);
   assert(result.follow_up_window_completed);
   assert(lifecycle.active_wake());
   assert(lifecycle.follow_up_stage() == FollowUpStage::NONE);
-  assert(lifecycle.one_shot_spent());
+  assert(lifecycle.per_answer_grant_available());
 
-  result = lifecycle.apply_trusted_phase(
+  result = apply_initial_phase(
+      lifecycle,
       PilotPhase::IDLE, 8200, wake_generation, false);
   assert(result.status == PhaseApplyStatus::APPLIED);
   assert(!result.active_after);
@@ -549,7 +1029,8 @@ static void test_stale_trusted_phase_is_a_noop_for_newer_wake() {
   assert(current_wake != first_wake);
   assert(lifecycle.mic_open());
 
-  auto result = lifecycle.apply_trusted_phase(
+  auto result = apply_initial_phase(
+      lifecycle,
       PilotPhase::THINKING, 8300, first_wake, true);
   assert(result.status == PhaseApplyStatus::STALE);
   assert(lifecycle.active_wake());
@@ -557,13 +1038,15 @@ static void test_stale_trusted_phase_is_a_noop_for_newer_wake() {
   assert(!lifecycle.muted());
   assert(lifecycle.wake_generation() == current_wake);
 
-  result = lifecycle.apply_trusted_phase(
+  result = apply_initial_phase(
+      lifecycle,
       PilotPhase::THINKING, 8300, current_wake, false);
   assert(result.status == PhaseApplyStatus::APPLIED);
   assert(!lifecycle.mic_open());
   assert(lifecycle.active_wake());
 
-  result = lifecycle.apply_trusted_phase(
+  result = apply_initial_phase(
+      lifecycle,
       PilotPhase::LISTENING, 8300, first_wake, false);
   assert(result.status == PhaseApplyStatus::STALE);
   assert(!lifecycle.mic_open());
@@ -587,7 +1070,7 @@ static void test_every_stale_trusted_phase_preserves_newer_wake_state() {
     assert(lifecycle.mic_open());
     assert(lifecycle.active_wake());
     assert(!lifecycle.pending_wake());
-    assert(!lifecycle.one_shot_spent());
+    assert(lifecycle.per_answer_grant_available());
     assert(!lifecycle.post_stop());
     assert(lifecycle.session_nonce() == 8350);
     assert(lifecycle.wake_generation() == current_wake);
@@ -611,7 +1094,8 @@ static void test_every_stale_trusted_phase_preserves_newer_wake_state() {
       PilotPhase::IDLE,
   };
   for (const PilotPhase target : stale_targets) {
-    const auto result = lifecycle.apply_trusted_phase(
+    const auto result = apply_initial_phase(
+        lifecycle,
         target, 8350, first_wake, true);
     assert(result.status == PhaseApplyStatus::STALE);
     assert_current_wake_unchanged();
@@ -727,7 +1211,8 @@ static void test_generation_effect_gate_closes_phase_replacement_race() {
   std::thread phase_thread([&]() {
     {
       std::lock_guard<GenerationEffectGate> effect_guard(gate);
-      old_plan = lifecycle.apply_trusted_phase(
+      old_plan = apply_initial_phase(
+          lifecycle,
           PilotPhase::THINKING, 8400, old_wake, false);
       assert(old_plan.status == PhaseApplyStatus::APPLIED);
       assert(lifecycle.phase_effect_plan_is_current(old_plan));
@@ -876,19 +1361,26 @@ int main() {
   static_assert(kProtocolTokenMax == 0x7FFFFFFF,
                 "Pilot credentials remain positive signed 31-bit values");
   static_assert(kAbsoluteSessionMaxMs == 120000,
-                "Every wake remains independently bounded");
+                "Every physical wake session remains bounded across rounds");
   static_assert(kRequestFollowUpReadyTimeoutMs >=
                     2000 + kFollowupOpenDelayMaxMs + 500,
                 "READY deadline must cover chime wait plus negotiated delay");
 
   test_strict_flat_json();
+  test_follow_up_phase_credential_contract();
+  test_runtime_deadline_and_mic_decisions();
   test_listening_requires_owned_open_mic();
   test_complete_two_phase_lifecycle();
   test_commit_races_fail_closed();
   test_prepare_and_ready_revocations_never_reopen();
   test_stale_wakes_timers_and_reconnects();
   test_delayed_wake_abort_stop_and_enrollment();
-  test_replay_and_bounded_histories();
+  test_replay_and_bounded_session_history();
+  test_bounded_serialized_round_history_fails_closed_and_resets();
+  test_stale_prior_round_phase_credentials_cannot_progress_open();
+  test_tokenized_idle_is_invalid_and_tokenless_idle_is_terminal();
+  test_commit_deadline_is_absolute_and_wrap_safe();
+  test_only_ordered_answer_speech_rearms_a_round();
   test_ready_nonce_replay_and_mismatch();
   test_stale_ready_callback_cannot_touch_new_wake();
   test_aborted_reservations_do_not_create_protocol_gaps();
