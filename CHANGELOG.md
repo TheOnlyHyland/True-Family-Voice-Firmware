@@ -124,8 +124,9 @@ legacy zero mode or downgrading firmware.
 - Build and package releases before any tag or public release exists. Protected
   preparation emits one source/tree/version/hash-bound immutable artifact;
   approved publication downloads that exact artifact by run and ID, verifies its
-  digest, publishes GitHub and no-clobber R2 bytes through a private draft, and
-  makes the release public last. Pages runs only after publication succeeds.
+  digest, publishes no-clobber GitHub assets through a private draft, reads every
+  asset back, and makes the release public last. Rapid-pilot publication leaves
+  Pages advertisement and channel migration to separate post-pilot work.
 - Make beta and production promotions consume public versioned GitHub bytes and
   matching versioned R2 bytes without rebuilding. Scope every R2 secret reference
   to the protected `firmware-release` environment.

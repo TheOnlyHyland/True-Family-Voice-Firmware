@@ -126,21 +126,10 @@ jobs:
         run: >-
           python3 ./scripts/verify-release-intent.py "$VERSION"
           "$SOURCE_COMMIT" "$SOURCE_TREE" "$PRERELEASE" prepared-release
-      - name: Refuse any existing tag, release, asset, or R2 object
+      - name: Refuse any existing tag or release
         shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          AWS_EC2_METADATA_DISABLED: "true"
-          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
-          R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
         run: |
           set -euo pipefail
-          : "${AWS_ACCESS_KEY_ID:?firmware-release R2 access key is required}"
-          : "${AWS_SECRET_ACCESS_KEY:?firmware-release R2 secret is required}"
-          : "${R2_ACCOUNT_ID:?firmware-release R2 account is required}"
-          : "${R2_BUCKET:?firmware-release R2 bucket is required}"
           if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
             printf 'refusing to reuse existing tag: %s\n' "$VERSION" >&2
             exit 1
@@ -149,15 +138,6 @@ jobs:
             printf 'refusing to reuse existing GitHub release: %s\n' "$VERSION" >&2
             exit 1
           fi
-          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          prefix="${GITHUB_REPOSITORY#*/}/home-assistant-voice/$VERSION/"
-          existing=$(aws s3api list-objects-v2 \
-            --endpoint-url "$endpoint" \
-            --bucket "$R2_BUCKET" \
-            --prefix "$prefix" \
-            --query 'length(Contents || `[]`)' \
-            --output text)
-          test "$existing" = "0"
       - name: Create exact tag and private draft release
         shell: bash
         run: |
@@ -205,54 +185,6 @@ jobs:
             cmp "$package/$file" "github-readback/$file"
           done
           python3 ./scripts/verify-release-package.py "$VERSION" github-readback
-      - name: Publish exact versioned R2 bytes without clobber and verify readback
-        shell: bash
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          AWS_EC2_METADATA_DISABLED: "true"
-          R2_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_R2_ACCOUNT_ID }}
-          R2_BUCKET: ${{ secrets.CLOUDFLARE_R2_BUCKET }}
-        run: |
-          set -euo pipefail
-          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          prefix="${GITHUB_REPOSITORY#*/}/home-assistant-voice/$VERSION"
-          package="prepared-release/package/$VERSION"
-          files=(
-            true-family-voice-esp32s3.factory.bin
-            true-family-voice-esp32s3.ota.bin
-            true-family-voice-esp32s3.elf
-            SHA256SUMS
-            manifest.json
-          )
-          for file in "${files[@]}"; do
-            case "$file" in
-              *.json) content_type=application/json ;;
-              SHA256SUMS) content_type=text/plain ;;
-              *) content_type=application/octet-stream ;;
-            esac
-            content_md5=$(openssl dgst -md5 -binary "$package/$file" | base64 --wrap=0)
-            aws s3api put-object \
-              --endpoint-url "$endpoint" \
-              --bucket "$R2_BUCKET" \
-              --key "$prefix/$file" \
-              --body "$package/$file" \
-              --content-md5 "$content_md5" \
-              --content-type "$content_type" \
-              --cache-control "public,max-age=31536000,immutable" \
-              --if-none-match "*" >/dev/null
-          done
-          mkdir r2-readback
-          for file in "${files[@]}"; do
-            aws s3api get-object \
-              --endpoint-url "$endpoint" \
-              --bucket "$R2_BUCKET" \
-              --key "$prefix/$file" \
-              "r2-readback/$file" >/dev/null
-            cmp "$package/$file" "r2-readback/$file"
-          done
-          python3 ./scripts/verify-release-package.py "$VERSION" r2-readback
       - name: Make verified draft public as the final publication operation
         id: published
         shell: bash
@@ -265,16 +197,3 @@ jobs:
           test "$(jq -r '.tagName' <<< "$published")" = "$VERSION"
           printf 'source_commit=%s\n' "$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
           printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
-
-  pages:
-    name: Advertise Only After Publication Succeeds
-    needs:
-      - publish
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    uses: ./.github/workflows/gh-pages.yml
-    with:
-      source_commit: ${{ needs.publish.outputs.source_commit }}
-      version: ${{ needs.publish.outputs.version }}
