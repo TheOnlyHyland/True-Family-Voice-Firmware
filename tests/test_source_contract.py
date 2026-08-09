@@ -672,13 +672,13 @@ class BuildContractTest(unittest.TestCase):
         self.assertNotIn("pip install", publish)
         self.assertLess(
             publish.index("--draft"),
-            publish.index("Publish exact versioned R2 bytes"),
+            publish.index("Upload draft assets without clobber"),
         )
         self.assertGreater(
             publish.index('gh release edit "$VERSION" --draft=false'),
-            publish.index("Publish exact versioned R2 bytes"),
+            publish.index("Upload draft assets without clobber"),
         )
-        self.assertIn("needs:\n      - publish", publish)
+        self.assertNotIn("uses: ./.github/workflows/gh-pages.yml", publish)
 
         self.assertIn("workflow_call:", pages)
         self.assertNotIn("workflow_dispatch:", pages)
@@ -727,13 +727,13 @@ class BuildContractTest(unittest.TestCase):
             self.read(".github/workflows/yaml-lint.yml"),
         )
 
-        self.assertIn('--if-none-match "*"', publish)
-        self.assertIn("Refuse any existing tag, release, asset, or R2 object", publish)
+        self.assertIn("Refuse any existing tag or release", publish)
         self.assertIn("github-readback", publish)
-        self.assertIn("r2-readback", publish)
         self.assertNotIn("--clobber", publish)
-        self.assertIn('cmp "$package/$file" "r2-readback/$file"', publish)
         self.assertIn('cmp "$package/$file" "github-readback/$file"', publish)
+        self.assertNotIn("CLOUDFLARE_R2", publish)
+        self.assertNotIn("R2_BUCKET", publish)
+        self.assertNotIn("aws s3", publish)
         self.assertIn("sha256:$ARTIFACT_DIGEST", publish)
         self.assertIn(".total_count", publish)
         self.assertIn("environment:\n      name: firmware-release", publish)

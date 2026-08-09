@@ -286,10 +286,11 @@ uploads one immutable artifact containing the five-file package plus canonical
 source/version/hash metadata. A separately approved publication dispatch accepts
 the exact preparation run, artifact ID, and artifact digest. It downloads by ID,
 rechecks source, tree, version, and every package hash, and never invokes a
-compiler. Publication refuses existing tags, releases, assets, and versioned R2
-objects. It creates a private draft, uploads and reads back GitHub and atomic
-no-overwrite R2 bytes, then makes the release public as its final operation.
-Pages is a reusable workflow called only after that publication job succeeds.
+compiler. Publication refuses existing tags and releases. It creates a private
+draft, uploads each GitHub asset without clobbering, reads every asset back,
+verifies the complete package, then makes the release public as its final
+operation. The rapid-pilot publisher does not advertise through Pages; migrating
+the installer and promotion channels away from R2 is separate post-pilot work.
 
 Beta and production channel promotions are separate manual approvals. They
 download the public GitHub package, require byte equality with its published
