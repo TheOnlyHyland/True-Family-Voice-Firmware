@@ -289,8 +289,11 @@ rechecks source, tree, version, and every package hash, and never invokes a
 compiler. Publication refuses existing tags and releases. It creates a private
 draft, uploads each GitHub asset without clobbering, reads every asset back,
 verifies the complete package, then makes the release public as its final
-operation. The rapid-pilot publisher does not advertise through Pages; migrating
-the installer and promotion channels away from R2 is separate post-pilot work.
+operation. A failed pre-asset run may resume only the exact empty private draft
+with matching source, version, title, body, and prerelease intent; the tag is
+verified after GitHub creates it during publication. The rapid-pilot publisher
+does not advertise through Pages; migrating the installer and promotion channels
+away from R2 is separate post-pilot work.
 
 Beta and production channel promotions are separate manual approvals. They
 download the public GitHub package, require byte equality with its published

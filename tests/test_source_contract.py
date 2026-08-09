@@ -727,7 +727,9 @@ class BuildContractTest(unittest.TestCase):
             self.read(".github/workflows/yaml-lint.yml"),
         )
 
-        self.assertIn("Refuse any existing tag or release", publish)
+        self.assertIn("Refuse tags and non-resumable releases", publish)
+        self.assertIn("resume_draft", publish)
+        self.assertIn("targetCommitish", publish)
         self.assertIn("github-readback", publish)
         self.assertNotIn("--clobber", publish)
         self.assertIn('cmp "$package/$file" "github-readback/$file"', publish)
@@ -737,6 +739,10 @@ class BuildContractTest(unittest.TestCase):
         self.assertIn("sha256:$ARTIFACT_DIGEST", publish)
         self.assertIn(".total_count", publish)
         self.assertIn("environment:\n      name: firmware-release", publish)
+        self.assertGreater(
+            publish.index('git fetch origin "refs/tags/$VERSION:refs/tags/$VERSION"'),
+            publish.index('gh release edit "$VERSION" --draft=false'),
+        )
 
         self.assertIn("gh release download", promotion)
         self.assertIn('cmp "$file" "r2-package/$name"', promotion)
