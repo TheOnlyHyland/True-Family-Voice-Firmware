@@ -665,6 +665,7 @@ class BuildContractTest(unittest.TestCase):
         self.assertIn("confirm_publish:", publish)
         self.assertIn("artifact-ids:", publish)
         self.assertIn("run-id:", publish)
+        self.assertIn("merge-multiple: true", publish)
         self.assertIn("verify-release-intent.py", publish)
         self.assertNotIn("esphome", publish.lower())
         self.assertNotIn("package-release", publish)
