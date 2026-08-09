@@ -119,6 +119,7 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.preparation_run_id }}
           path: prepared-release
+          merge-multiple: true
       - name: Verify source, version, intent, and every package hash
         env:
           SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
