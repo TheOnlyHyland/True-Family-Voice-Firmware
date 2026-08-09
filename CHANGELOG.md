@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.20.0
+
+- Replace the physical-wake one-shot with one PREPARE grant per genuine answer.
+  A successful ordered `OPEN -> listening -> thinking -> replying` round rearms
+  exactly one grant while retaining the original physical wake generation.
+- Permit serialized follow-up rounds inside the existing generation-bound
+  120-second whole-session ceiling, with fixed non-evicting 256-value token and
+  READY-nonce histories that fail closed if exhausted.
+- Store each OPEN microphone aperture's absolute 10-second deadline at COMMIT.
+  Check it from lifecycle transitions, the main loop, mic lease admission, and
+  the cooperative timer so delayed callbacks cannot admit late phases or rearm.
+- Require OPEN `listening`, `thinking`, and `replying` phases to echo the exact
+  current follow-up token. Delayed phases from an older round are harmless
+  no-ops and cannot progress a later OPEN transaction.
+- Keep terminal `idle` tokenless. Any tokenized `idle` is invalid and fails the
+  current wake closed rather than being treated as delayed progression traffic.
+- Reset the fixed round histories only for a fresh hello; reconnect recovery
+  preserves them and never evicts an older accepted credential.
+- Never rearm after denied, failed, cancelled, malformed, stale, disconnected,
+  muted, stopped, media-conflicted, timed-out, or session-ceiling paths. These
+  paths continue to close locally before bounded protocol cleanup.
+- Update immutable package refs, factory metadata, installer links, tests, and
+  release version checks to `0.20.0`.
+
+### Deployment Compatibility
+
+Firmware `0.20.0` retains ordinary single-turn compatibility with backend
+`0.20.6` and the nonce-bearing protected protocol introduced by backend
+`0.21.x`. Backend `0.21.x` still sends tokenless trusted phases, so all explicit
+follow-up OPEN answers fail closed; only ordinary physical-wake turns are
+compatible. Coordinated backend `0.22.0` is required for any explicit follow-up.
+Deploy firmware before backend `0.22.0`. Rollback remains backend-first as
+documented in `INSTALL.md`: after restoring backend `0.20.6`, restart the
+still-installed firmware to clear its trusted session nonce before verifying
+legacy zero mode or downgrading firmware.
+
 ## 0.19.0
 
 - Add nonce- and token-bound model-selected follow-up requests in closed,
@@ -96,8 +132,9 @@
 - Lock Actionlint `1.7.12`, GNU patch `2.7.6`, and the PlatformIO Improv `1.2.4`
   archive; verify the exact extracted Improv tree and normalized ESP-IDF
   component-manager closure after compilation.
-- Document mandatory backend-first rollback: restore and verify backend `0.20.6`
-  with firmware `0.19.0` still installed before downgrading firmware.
+- Document mandatory backend-first rollback: restore backend `0.20.6`, restart
+  the still-installed firmware to clear its trusted session nonce, and verify
+  legacy zero mode before downgrading firmware.
 - Make ESPHome `2026.7.3` release timestamps reproducible with one hash-bound,
   fail-closed `SOURCE_DATE_EPOCH` patch and the same deterministic local and
   protected-CI environment.

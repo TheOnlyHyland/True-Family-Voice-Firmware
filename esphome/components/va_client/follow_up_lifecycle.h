@@ -14,7 +14,21 @@ enum class PilotAuthMode : uint8_t { NONE = 0, LEGACY_ZERO, NONCE };
 enum class PilotPhase : uint8_t { IDLE = 0, WAITING, LISTENING, THINKING, REPLYING, ENROLLING };
 enum class FollowUpStage : uint8_t { NONE = 0, PREPARED, READY, OPEN };
 enum class HelloAdmission : uint8_t { REJECTED = 0, FRESH, RECOVERY };
-enum class PhaseApplyStatus : uint8_t { APPLIED = 0, STALE, REJECTED };
+enum class PhaseApplyStatus : uint8_t { APPLIED = 0, STALE, EXPIRED, REJECTED };
+enum class PhaseRuntimeAction : uint8_t { APPLY = 0, IGNORE, EXPIRE, REVOKE };
+
+inline PhaseRuntimeAction phase_runtime_action(PhaseApplyStatus status) {
+  switch (status) {
+    case PhaseApplyStatus::APPLIED:
+      return PhaseRuntimeAction::APPLY;
+    case PhaseApplyStatus::STALE:
+      return PhaseRuntimeAction::IGNORE;
+    case PhaseApplyStatus::EXPIRED:
+      return PhaseRuntimeAction::EXPIRE;
+    default:
+      return PhaseRuntimeAction::REVOKE;
+  }
+}
 
 struct PhaseApplyResult {
   PhaseApplyStatus status{PhaseApplyStatus::REJECTED};
@@ -64,8 +78,9 @@ class MicSendFence {
   std::atomic_uint32_t in_flight_{0};
 };
 
-// Authoritative pilot lifecycle. VaClient serializes every call with
-// followup_mux_; the host tests call the same transitions directly.
+// Authoritative pilot lifecycle. VaClient uses its generation-effect gate for
+// effect ordering and followup_mux_ for cross-task snapshots; host tests call
+// the same transitions directly.
 class FollowUpLifecycle {
  public:
   void on_connected() {
@@ -164,7 +179,7 @@ class FollowUpLifecycle {
     this->last_reserved_wake_ = this->pending_reservation_;
     this->reserved_protocol_wake_generation_ = next_generation_(this->wake_generation_);
     this->pending_wake_ = true;
-    this->one_shot_spent_ = false;
+    this->per_answer_grant_available_ = true;
     this->post_stop_ = false;
     this->phase_ = PilotPhase::WAITING;
     return this->pending_reservation_;
@@ -230,6 +245,11 @@ class FollowUpLifecycle {
       this->revoke_wake_();
       return false;
     }
+    if (this->follow_up_stage_ == FollowUpStage::OPEN &&
+        (this->phase_ == PilotPhase::WAITING ||
+         this->phase_ == PilotPhase::LISTENING)) {
+      this->follow_up_answer_speech_observed_ = true;
+    }
     this->phase_ = PilotPhase::LISTENING;
     return true;
   }
@@ -239,6 +259,10 @@ class FollowUpLifecycle {
       this->revoke_wake_();
       return false;
     }
+    this->follow_up_answer_endpointed_ =
+        this->follow_up_stage_ == FollowUpStage::OPEN && close_mic &&
+        this->phase_ == PilotPhase::LISTENING &&
+        this->follow_up_answer_speech_observed_;
     if (close_mic)
       this->close_mic_();
     this->phase_ = PilotPhase::THINKING;
@@ -258,8 +282,13 @@ class FollowUpLifecycle {
       this->close_mic_();
     const bool completed = this->follow_up_stage_ == FollowUpStage::OPEN;
     if (completed) {
+      this->per_answer_grant_available_ =
+          this->phase_ == PilotPhase::THINKING &&
+          this->follow_up_answer_endpointed_;
       this->follow_up_stage_ = FollowUpStage::NONE;
       this->credentials_ = {};
+      this->reset_follow_up_answer_();
+      this->clear_follow_up_deadline_();
     }
     if (follow_up_window_completed != nullptr)
       *follow_up_window_completed = completed;
@@ -283,10 +312,12 @@ class FollowUpLifecycle {
     admission.active_session_nonce = this->session_nonce_;
     admission.message_shape_valid = true;
     admission.token_replayed_or_history_full =
-        contains_(this->follow_up_token_history_, this->follow_up_token_history_count_, token) ||
-        this->follow_up_token_history_count_ >= this->follow_up_token_history_.size();
+        contains_(this->follow_up_token_history_,
+                  this->follow_up_token_history_count_, token) ||
+        this->follow_up_token_history_count_ >=
+            this->follow_up_token_history_.size();
     admission.physical_wake_active = this->active_wake_;
-    admission.one_shot_consumed = this->one_shot_spent_;
+    admission.per_answer_grant_available = this->per_answer_grant_available_;
     admission.replying = this->phase_ == PilotPhase::REPLYING;
     admission.closed_single_turn = true;
     admission.connected = this->connected_ && this->auth_mode_ == PilotAuthMode::NONCE;
@@ -301,8 +332,9 @@ class FollowUpLifecycle {
       return false;
     }
 
-    this->follow_up_token_history_[this->follow_up_token_history_count_++] = token;
-    this->one_shot_spent_ = true;
+    this->follow_up_token_history_[this->follow_up_token_history_count_++] =
+        token;
+    this->per_answer_grant_available_ = false;
     this->follow_up_stage_ = FollowUpStage::PREPARED;
     this->credentials_ = {token, session_nonce, this->wake_generation_, 0, 0};
     return true;
@@ -311,8 +343,10 @@ class FollowUpLifecycle {
   bool ready_nonce_available(uint32_t ready_nonce) const {
     return ready_nonce != 0 && ready_nonce <= kProtocolTokenMax &&
            ready_nonce != this->credentials_.token && ready_nonce != this->session_nonce_ &&
-           !contains_(this->ready_nonce_history_, this->ready_nonce_history_count_, ready_nonce) &&
-           this->ready_nonce_history_count_ < this->ready_nonce_history_.size();
+           !contains_(this->ready_nonce_history_,
+                      this->ready_nonce_history_count_, ready_nonce) &&
+           this->ready_nonce_history_count_ <
+               this->ready_nonce_history_.size();
   }
 
   bool mark_follow_up_ready(uint32_t token, uint32_t session_nonce, uint32_t ready_nonce,
@@ -328,7 +362,8 @@ class FollowUpLifecycle {
       this->revoke_wake_();
       return false;
     }
-    this->ready_nonce_history_[this->ready_nonce_history_count_++] = ready_nonce;
+    this->ready_nonce_history_[this->ready_nonce_history_count_++] =
+        ready_nonce;
     this->credentials_.ready_nonce = ready_nonce;
     this->credentials_.audio_generation = audio_generation;
     this->follow_up_stage_ = FollowUpStage::READY;
@@ -348,23 +383,61 @@ class FollowUpLifecycle {
   }
 
   bool open_follow_up_after_commit(uint32_t token, uint32_t session_nonce, uint32_t ready_nonce,
-                                    uint32_t audio_generation,
+                                    uint32_t audio_generation, uint32_t opened_at_ms,
                                     bool announcement_path_clear = true) {
     if (!this->commit_is_safe(token, session_nonce, ready_nonce, audio_generation,
                               announcement_path_clear)) {
       this->revoke_wake_();
       return false;
     }
+    // Arm the deadline before the mic gate. The runtime retains the outer
+    // generation lock until its cooperative timer is installed.
+    this->follow_up_deadline_ms_ = opened_at_ms + kRequestFollowUpMs;
+    this->follow_up_deadline_armed_ = true;
     this->follow_up_stage_ = FollowUpStage::OPEN;
+    this->reset_follow_up_answer_();
     this->mic_open_ = true;
     this->phase_ = PilotPhase::WAITING;
     return true;
   }
 
-  bool hard_timeout_matches(uint32_t wake_generation, uint32_t ready_nonce) const {
-    return this->follow_up_stage_ == FollowUpStage::OPEN && this->active_wake_ &&
-           wake_generation != 0 && wake_generation == this->credentials_.wake_generation &&
-           ready_nonce != 0 && ready_nonce == this->credentials_.ready_nonce;
+  bool follow_up_deadline_reached(uint32_t now_ms) const {
+    return decide_follow_up_runtime(
+               this->follow_up_runtime_snapshot(this->mic_open_), now_ms,
+               this->credentials_.wake_generation, this->credentials_.token)
+               .deadline_action == FollowUpDeadlineAction::EXPIRE;
+  }
+
+  uint32_t follow_up_deadline_remaining_ms(uint32_t now_ms) const {
+    return decide_follow_up_runtime(
+               this->follow_up_runtime_snapshot(this->mic_open_), now_ms,
+               this->credentials_.wake_generation, this->credentials_.token)
+        .timer_delay_ms;
+  }
+
+  bool expire_follow_up_deadline(uint32_t now_ms, uint32_t wake_generation,
+                                 uint32_t token) {
+    const FollowUpRuntimeDecision decision = decide_follow_up_runtime(
+        this->follow_up_runtime_snapshot(this->mic_open_), now_ms,
+        wake_generation, token);
+    if (decision.deadline_action != FollowUpDeadlineAction::EXPIRE)
+      return false;
+    this->revoke_wake_();
+    return true;
+  }
+
+  FollowUpRuntimeSnapshot follow_up_runtime_snapshot(
+      bool runtime_streaming) const {
+    FollowUpRuntimeSnapshot snapshot;
+    snapshot.follow_up_open =
+        this->follow_up_stage_ == FollowUpStage::OPEN;
+    snapshot.deadline_armed = this->follow_up_deadline_armed_;
+    snapshot.deadline_ms = this->follow_up_deadline_ms_;
+    snapshot.wake_generation = this->credentials_.wake_generation;
+    snapshot.token = this->credentials_.token;
+    snapshot.mic_open = this->mic_open_;
+    snapshot.streaming = runtime_streaming;
+    return snapshot;
   }
 
   bool silent_wake_timeout_matches(uint32_t wake_generation) const {
@@ -388,25 +461,42 @@ class FollowUpLifecycle {
   PhaseApplyResult apply_trusted_phase(PilotPhase target,
                                        uint32_t session_nonce,
                                        uint32_t wake_generation,
-                                       bool microphone_muted) {
+                                       bool microphone_muted,
+                                       bool follow_up_token_present,
+                                       uint32_t follow_up_token,
+                                       uint32_t now_ms) {
     if (!this->connected_ || this->auth_mode_ != PilotAuthMode::NONCE ||
         session_nonce == 0 || session_nonce != this->session_nonce_)
       return {};
+    const FollowUpPhaseCredentialDecision credential_decision =
+        decide_follow_up_phase_credential(
+            this->follow_up_stage_ == FollowUpStage::OPEN,
+            target == PilotPhase::IDLE, follow_up_token_present,
+            follow_up_token, this->credentials_.token);
+    if (credential_decision == FollowUpPhaseCredentialDecision::REJECT)
+      return {};
+    // The COMMIT deadline remains authoritative through reply admission and
+    // grant rearm, even after thinking has already closed the mic. Check it
+    // before classifying delayed same-session traffic so any scheduled work
+    // that reaches the lifecycle after the cutoff closes the current round.
+    if (this->follow_up_stage_ == FollowUpStage::OPEN &&
+        this->follow_up_deadline_reached(now_ms)) {
+      return this->make_non_applied_phase_result_(PhaseApplyStatus::EXPIRED,
+                                                  target);
+    }
     // A delayed phase from an older wake on the same admitted session cannot
     // mutate the current owner. This comparison happens before mute or any
     // other lifecycle state is touched.
     if (!this->active_wake_ || wake_generation == 0 ||
         wake_generation != this->wake_generation_) {
-      PhaseApplyResult stale;
-      stale.status = PhaseApplyStatus::STALE;
-      stale.previous = this->phase_;
-      stale.target = target;
-      stale.active_after = this->active_wake_;
-      stale.connection_generation = this->connection_generation_;
-      stale.session_nonce = this->session_nonce_;
-      stale.wake_generation = this->wake_generation_;
-      stale.effect_epoch = this->effect_epoch_;
-      return stale;
+      return this->make_non_applied_phase_result_(PhaseApplyStatus::STALE,
+                                                  target);
+    }
+    if (credential_decision == FollowUpPhaseCredentialDecision::STALE) {
+      // A well-formed non-current progression token is delayed traffic. It
+      // must not mutate the physical turn or a later transaction.
+      return this->make_non_applied_phase_result_(PhaseApplyStatus::STALE,
+                                                  target);
     }
     this->set_muted(microphone_muted);
     if (!this->active_wake_)
@@ -477,7 +567,15 @@ class FollowUpLifecycle {
   bool active_wake() const { return this->active_wake_; }
   bool enrollment() const { return this->enrollment_; }
   bool pending_wake() const { return this->pending_wake_; }
-  bool one_shot_spent() const { return this->one_shot_spent_; }
+  bool per_answer_grant_available() const {
+    return this->per_answer_grant_available_;
+  }
+  size_t follow_up_token_history_count() const {
+    return this->follow_up_token_history_count_;
+  }
+  size_t ready_nonce_history_count() const {
+    return this->ready_nonce_history_count_;
+  }
   bool post_stop() const { return this->post_stop_; }
   uint32_t session_nonce() const { return this->session_nonce_; }
   uint32_t wake_generation() const { return this->wake_generation_; }
@@ -501,7 +599,7 @@ class FollowUpLifecycle {
   const FollowUpCredentials &credentials() const { return this->credentials_; }
 
  private:
-  static constexpr size_t kHistorySize = 256;
+  static constexpr size_t kSessionHistorySize = 256;
 
   bool base_safe_() const {
     return this->connected_ && this->auth_mode_ != PilotAuthMode::NONE && !this->muted_ &&
@@ -565,6 +663,20 @@ class FollowUpLifecycle {
     return result;
   }
 
+  PhaseApplyResult make_non_applied_phase_result_(
+      PhaseApplyStatus status, PilotPhase target) const {
+    PhaseApplyResult result;
+    result.status = status;
+    result.previous = this->phase_;
+    result.target = target;
+    result.active_after = this->active_wake_;
+    result.connection_generation = this->connection_generation_;
+    result.session_nonce = this->session_nonce_;
+    result.wake_generation = this->wake_generation_;
+    result.effect_epoch = this->effect_epoch_;
+    return result;
+  }
+
   void revoke_wake_() {
     this->effect_epoch_ = next_generation_(this->effect_epoch_);
     this->close_mic_();
@@ -572,8 +684,11 @@ class FollowUpLifecycle {
     this->pending_reservation_ = 0;
     this->transmitted_reservation_ = 0;
     this->active_wake_ = false;
+    this->per_answer_grant_available_ = false;
     this->follow_up_stage_ = FollowUpStage::NONE;
     this->credentials_ = {};
+    this->reset_follow_up_answer_();
+    this->clear_follow_up_deadline_();
   }
 
   void close_mic_() {
@@ -586,7 +701,18 @@ class FollowUpLifecycle {
     return current == 0 || current >= kProtocolTokenMax ? 1 : current + 1;
   }
 
-  static bool contains_(const std::array<uint32_t, kHistorySize> &values, size_t count,
+  void reset_follow_up_answer_() {
+    this->follow_up_answer_speech_observed_ = false;
+    this->follow_up_answer_endpointed_ = false;
+  }
+
+  void clear_follow_up_deadline_() {
+    this->follow_up_deadline_armed_ = false;
+    this->follow_up_deadline_ms_ = 0;
+  }
+
+  template <size_t N>
+  static bool contains_(const std::array<uint32_t, N> &values, size_t count,
                         uint32_t value) {
     for (size_t i = 0; i < count; i++) {
       if (values[i] == value)
@@ -602,7 +728,9 @@ class FollowUpLifecycle {
   bool pending_wake_{false};
   bool active_wake_{false};
   bool mic_open_{false};
-  bool one_shot_spent_{true};
+  bool per_answer_grant_available_{false};
+  bool follow_up_answer_speech_observed_{false};
+  bool follow_up_answer_endpointed_{false};
   PilotAuthMode auth_mode_{PilotAuthMode::NONE};
   PilotPhase phase_{PilotPhase::IDLE};
   FollowUpStage follow_up_stage_{FollowUpStage::NONE};
@@ -618,12 +746,15 @@ class FollowUpLifecycle {
   uint32_t mic_epoch_{0};
   uint32_t audio_generation_{0};
   uint32_t effect_epoch_{0};
+  uint32_t follow_up_deadline_ms_{0};
+  bool follow_up_deadline_armed_{false};
   FollowUpCredentials credentials_{};
-  std::array<uint32_t, kHistorySize> session_nonce_history_{};
+  std::array<uint32_t, kSessionHistorySize> session_nonce_history_{};
   size_t session_nonce_history_count_{0};
-  std::array<uint32_t, kHistorySize> follow_up_token_history_{};
+  std::array<uint32_t, kFollowUpReplayHistorySize>
+      follow_up_token_history_{};
   size_t follow_up_token_history_count_{0};
-  std::array<uint32_t, kHistorySize> ready_nonce_history_{};
+  std::array<uint32_t, kFollowUpReplayHistorySize> ready_nonce_history_{};
   size_t ready_nonce_history_count_{0};
 };
 

@@ -3,7 +3,7 @@
 #
 # Same as esphome-builder.dhcp.yaml, but pinned to a static IP. Copy THIS into your
 # ESPHome dashboard ONCE (adopt the device, then edit its YAML). It pulls the
-# full firmware from this repo at immutable `0.19.0` refs.
+# full firmware from this repo at immutable `0.20.0` refs.
 # Those refs do not auto-discover later releases.
 #
 #   1. Set `name` / `friendly_name` for your device.
@@ -30,12 +30,12 @@ substitutions:
   dns1: !secret dns1
   dns2: !secret dns2
 
-# These `0.19.0` refs are immutable input and do not discover later releases.
+# These `0.20.0` refs are immutable input and do not discover later releases.
 # Change both together only after approving a newer exact release tag.
 packages:
   realtime:
     url: https://github.com/TheOnlyHyland/True-Family-Voice-Firmware
-    ref: "0.19.0"
+    ref: "0.20.0"
     files:
       - home-assistant-voice.realtime.yaml
       - home-assistant-voice.adopted.yaml
@@ -51,5 +51,5 @@ packages:
         dns2: ${dns2}
 
 dashboard_import:
-  package_import_url: github://TheOnlyHyland/True-Family-Voice-Firmware/esphome-builder.static-ip.yaml@0.19.0
+  package_import_url: github://TheOnlyHyland/True-Family-Voice-Firmware/esphome-builder.static-ip.yaml@0.20.0
   import_full_config: false

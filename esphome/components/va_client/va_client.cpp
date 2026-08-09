@@ -113,6 +113,8 @@ void VaClient::setup() {
 
 void VaClient::loop() {
   std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  if (this->expire_follow_up_deadline_(millis(), 0, 0))
+    return;
   // Drain the audio ring buffer into the speaker. speaker.play() accepts
   // only what fits in its own ring (returns the count actually queued).
   if (this->speaker_ != nullptr && this->audio_buf_ != nullptr &&
@@ -884,16 +886,32 @@ void VaClient::handle_text_(const char *data, size_t len) {
     const bool announcement_clear = this->announcement_path_clear_();
     const bool microphone_ready = !this->microphone_is_muted_();
     bool opened = false;
+    uint32_t hard_timeout_delay_ms = 0;
     portENTER_CRITICAL(&this->followup_mux_);
     const uint32_t final_audio_generation = this->lifecycle_.audio_generation();
     if (ring_empty && speaker_drained && announcement_clear && microphone_ready &&
         this->mic_send_fence_.in_flight() == 0 &&
         final_audio_generation == audio_generation) {
+      const uint32_t opened_at_ms = millis();
       opened = this->lifecycle_.open_follow_up_after_commit(
           token, session_nonce, ready_nonce, final_audio_generation,
-          announcement_clear);
+          opened_at_ms, announcement_clear);
       if (opened) {
         this->streaming_ = true;
+        const FollowUpRuntimeDecision runtime_decision =
+            decide_follow_up_runtime(
+                this->lifecycle_.follow_up_runtime_snapshot(
+                    this->streaming_.load()),
+                millis(), wake_generation, token);
+        if (runtime_decision.deadline_action ==
+                FollowUpDeadlineAction::SCHEDULE &&
+            runtime_decision.timer_delay_ms != 0) {
+          hard_timeout_delay_ms = runtime_decision.timer_delay_ms;
+        } else {
+          this->lifecycle_.revoke();
+          this->streaming_ = false;
+          opened = false;
+        }
       }
     } else {
       this->lifecycle_.revoke();
@@ -909,29 +927,9 @@ void VaClient::handle_text_(const char *data, size_t len) {
     ESP_LOGI(TAG, "two-phase follow-up mic open; hard timeout=%u ms",
              (unsigned) kRequestFollowUpMs);
     this->set_timeout(
-        "va_request_follow_up_hard", kRequestFollowUpMs,
-        [this, wake_generation, ready_nonce]() {
-          std::lock_guard<GenerationEffectGate> effect_guard(
-              this->generation_effect_gate_);
-          bool matches = false;
-          uint32_t session_nonce = 0;
-          portENTER_CRITICAL(&this->followup_mux_);
-          matches = this->lifecycle_.hard_timeout_matches(wake_generation, ready_nonce);
-          if (matches) {
-            session_nonce = this->lifecycle_.session_nonce();
-            this->lifecycle_.revoke();
-            this->streaming_ = false;
-          }
-          portEXIT_CRITICAL(&this->followup_mux_);
-          if (!matches)
-            return;
-          if (!this->wait_for_mic_send_barrier_(
-                  "follow_up_timeout_mic_send_barrier_failed"))
-            return;
-          this->send_mic_flush_(session_nonce, wake_generation);
-          this->send_interrupt_control_("follow_up_timeout", session_nonce,
-                                        wake_generation);
-          this->fire_phase_led_("idle");
+        "va_request_follow_up_hard", hard_timeout_delay_ms,
+        [this, wake_generation, token]() {
+          this->expire_follow_up_deadline_(millis(), wake_generation, token);
         });
     this->fire_phase_led_("listening");
     return;
@@ -1054,15 +1052,25 @@ void VaClient::handle_text_(const char *data, size_t len) {
     std::string value;
     uint32_t session_nonce = 0;
     uint32_t wake_generation = 0;
+    uint32_t follow_up_token = 0;
     const bool value_valid = message.get_string("value", value);
     const bool legacy_shape =
         value_valid && message.has_exact({"type", "value"});
-    const bool trusted_shape =
+    const bool trusted_base_shape =
         value_valid &&
         message.has_exact(
             {"type", "value", "session_nonce", "wake_generation"}) &&
         message.get_uint("session_nonce", session_nonce) &&
         message.get_uint("wake_generation", wake_generation);
+    const bool trusted_follow_up_shape =
+        value_valid &&
+        message.has_exact({"type", "value", "session_nonce",
+                           "wake_generation", "token"}) &&
+        message.get_uint("session_nonce", session_nonce) &&
+        message.get_uint("wake_generation", wake_generation) &&
+        message.get_uint("token", follow_up_token);
+    const bool trusted_shape =
+        trusted_base_shape || trusted_follow_up_shape;
 
     PilotPhase lifecycle_phase = PilotPhase::IDLE;
     Phase runtime_phase = Phase::IDLE;
@@ -1087,6 +1095,7 @@ void VaClient::handle_text_(const char *data, size_t len) {
     const bool microphone_muted = this->microphone_is_muted_();
     const Phase runtime_previous =
         static_cast<Phase>(this->current_phase_.load());
+    const uint32_t phase_received_ms = millis();
     PhaseApplyResult transition;
     portENTER_CRITICAL(&this->followup_mux_);
     if (this->lifecycle_.legacy_zero()) {
@@ -1098,16 +1107,27 @@ void VaClient::handle_text_(const char *data, size_t len) {
       if (trusted_shape) {
         transition = this->lifecycle_.apply_trusted_phase(
             lifecycle_phase, session_nonce, wake_generation,
-            microphone_muted);
+            microphone_muted, trusted_follow_up_shape, follow_up_token,
+            phase_received_ms);
       }
     }
     portEXIT_CRITICAL(&this->followup_mux_);
 
-    if (transition.status == PhaseApplyStatus::STALE) {
-      ESP_LOGD(TAG, "stale phase ignored without touching current wake");
+    const PhaseRuntimeAction runtime_action =
+        phase_runtime_action(transition.status);
+    if (runtime_action == PhaseRuntimeAction::EXPIRE) {
+      ESP_LOGW(TAG, "follow-up phase arrived after the COMMIT deadline");
+      if (!this->expire_follow_up_deadline_(phase_received_ms, 0, 0)) {
+        this->revoke_followup_("follow_up_deadline", true);
+      }
       return;
     }
-    if (transition.status != PhaseApplyStatus::APPLIED) {
+    if (runtime_action == PhaseRuntimeAction::IGNORE) {
+      ESP_LOGD(TAG,
+               "stale wake or follow-up phase credential ignored");
+      return;
+    }
+    if (runtime_action == PhaseRuntimeAction::REVOKE) {
       this->revoke_followup_("malformed_phase", true);
       return;
     }
@@ -1263,6 +1283,8 @@ void VaClient::handle_binary_(const uint8_t *data, size_t len) {
 void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
   if (!this->ws_connected_ || this->ws_handle_ == nullptr)
     return;
+  if (this->expire_follow_up_deadline_(millis(), 0, 0))
+    return;
   // i2s_mics yields interleaved stereo int32 frames: [L0_low,L0_high, R0_low,R0_high, L1..].
   // Each frame = 8 bytes (2ch × 4 bytes). We want one channel converted to
   // int16 mono. Real audio sits in the high 16 bits (ADC pads up to int32).
@@ -1289,22 +1311,41 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
   // "phase":"idle" from the server (response.done).
   bool owned_open_mic = false;
   bool send_lease_acquired = false;
+  bool follow_up_deadline_due = false;
   uint32_t send_lease_epoch = 0;
   const bool microphone_muted = this->microphone_is_muted_();
   {
     std::lock_guard<GenerationEffectGate> effect_guard(
         this->generation_effect_gate_);
     portENTER_CRITICAL(&this->followup_mux_);
-    this->lifecycle_.set_muted(microphone_muted);
-    owned_open_mic = this->lifecycle_.mic_open();
-    if (!owned_open_mic)
-      this->streaming_ = false;
-    if (owned_open_mic && this->streaming_) {
-      send_lease_epoch = this->lifecycle_.mic_epoch();
-      this->mic_send_fence_.acquire();
-      send_lease_acquired = true;
+    FollowUpRuntimeSnapshot runtime_snapshot =
+        this->lifecycle_.follow_up_runtime_snapshot(this->streaming_.load());
+    FollowUpRuntimeDecision runtime_decision = decide_follow_up_runtime(
+        runtime_snapshot, millis(), 0, 0);
+    follow_up_deadline_due =
+        runtime_decision.deadline_action == FollowUpDeadlineAction::EXPIRE;
+    if (!follow_up_deadline_due) {
+      this->lifecycle_.set_muted(microphone_muted);
+      runtime_snapshot = this->lifecycle_.follow_up_runtime_snapshot(
+          this->streaming_.load());
+      runtime_decision =
+          decide_follow_up_runtime(runtime_snapshot, millis(), 0, 0);
+      follow_up_deadline_due =
+          runtime_decision.deadline_action == FollowUpDeadlineAction::EXPIRE;
+      owned_open_mic = runtime_snapshot.mic_open;
+      if (!owned_open_mic)
+        this->streaming_ = false;
+      if (runtime_decision.mic_send_allowed) {
+        send_lease_epoch = this->lifecycle_.mic_epoch();
+        this->mic_send_fence_.acquire();
+        send_lease_acquired = true;
+      }
     }
     portEXIT_CRITICAL(&this->followup_mux_);
+  }
+  if (follow_up_deadline_due) {
+    this->expire_follow_up_deadline_(millis(), 0, 0);
+    return;
   }
   if (!send_lease_acquired) {
     this->preroll_push_(this->mono_buf_.data(), this->mono_buf_.size());
@@ -1313,13 +1354,23 @@ void VaClient::on_mic_data_(const std::vector<uint8_t> &samples) {
 
   bool send_lease_current = false;
   portENTER_CRITICAL(&this->followup_mux_);
-  send_lease_current = this->streaming_ && MicSendFence::lease_is_current(
-                                                    send_lease_epoch,
-                                                    this->lifecycle_.mic_epoch(),
-                                                    this->lifecycle_.mic_open());
+  const FollowUpRuntimeSnapshot runtime_snapshot =
+      this->lifecycle_.follow_up_runtime_snapshot(this->streaming_.load());
+  const FollowUpRuntimeDecision runtime_decision = decide_follow_up_runtime(
+      runtime_snapshot, millis(), 0, 0);
+  follow_up_deadline_due =
+      runtime_decision.deadline_action == FollowUpDeadlineAction::EXPIRE;
+  send_lease_current = runtime_decision.mic_send_allowed &&
+                       MicSendFence::lease_is_current(
+                           send_lease_epoch, this->lifecycle_.mic_epoch(),
+                           this->lifecycle_.mic_open());
   portEXIT_CRITICAL(&this->followup_mux_);
   if (!send_lease_current) {
     this->mic_send_fence_.release();
+    if (follow_up_deadline_due) {
+      this->expire_follow_up_deadline_(millis(), 0, 0);
+      return;
+    }
     this->preroll_push_(this->mono_buf_.data(), this->mono_buf_.size());
     return;
   }
@@ -1492,7 +1543,7 @@ void VaClient::apply_phase_side_effects_(
   //   thinking   → trusted input closes immediately; response ownership and
   //                the physical wake generation remain active
   //   replying   → trusted input remains closed; a model-selected follow-up
-  //                may consume the still-active wake's one-shot budget
+  //                may consume the current answer's single round grant
   //   idle       → terminal unless a PREPARED/READY explicit follow-up owns it
   // Legacy zero mode retains its pre-0.19 barge-in behavior.
   if (phase == "listening") {
@@ -1500,8 +1551,6 @@ void VaClient::apply_phase_side_effects_(
     this->graceful_close_prepared_token_ = 0;
     this->graceful_close_token_ = 0;
     this->cancel_timeout("va_graceful_close");
-    if (this->request_follow_up_token_.load() != 0)
-      this->clear_request_follow_up_(false);
     ESP_LOGI(TAG, "phase=listening confirmed for current physical owner");
     // Handsfree barge-in cut-over: a `listening` arriving while we still have
     // TTS queued means the backend's server VAD heard the user talk over the
@@ -1668,8 +1717,8 @@ void VaClient::apply_phase_side_effects_(
       this->idle_emit_pending_ = true;
       return;  // suppress immediate trigger fire — open_followup_window_ will fire it later
     }
-    // A completed response never grants another request. This only revokes the
-    // current wake; it does not replenish the already-spent one-shot budget.
+    // A completed response grants nothing by itself. Only an ordered explicit
+    // OPEN -> listening -> thinking -> replying round replenishes one grant.
   }
 
   // set_phase_ may be called from the websocket task; ESPHome triggers and
@@ -2100,8 +2149,10 @@ bool VaClient::send_mic_flush_(uint32_t session_nonce,
   // audio "completes" it and the model answers a stale half-sentence. Drop it
   // NOW, at the cut-off, so no reactive clear-on-wake is needed (that disturbed
   // the server VAD and caused garbage commits). This timer only fires when the
-  // user did NOT trigger speech — `listening` cancels va_followup — so it can
-  // never drop a valid command. Cheap no-op when the buffer was empty.
+  // Legacy inactivity windows cancel their timer on `listening`. The explicit
+  // round deadline intentionally remains armed after speech and may flush a
+  // partial utterance at its absolute 10-second cutoff. Cheap no-op when the
+  // buffer was empty.
   std::string message = this->legacy_zero_mode_()
                             ? "{\"type\":\"flush\"}"
                             : "{\"type\":\"flush\",\"session_nonce\":" +
@@ -2334,6 +2385,49 @@ bool VaClient::announcement_path_clear_() {
   return !this->announcement_active_.load() &&
          this->announcement_speaker_ != nullptr &&
          !this->announcement_speaker_->has_buffered_data();
+}
+
+bool VaClient::expire_follow_up_deadline_(
+    uint32_t now_ms, uint32_t expected_wake_generation,
+    uint32_t expected_token) {
+  std::lock_guard<GenerationEffectGate> effect_guard(
+      this->generation_effect_gate_);
+  ControlContext context;
+  uint32_t token = 0;
+  bool mic_was_open = false;
+  bool expired = false;
+  portENTER_CRITICAL(&this->followup_mux_);
+  const FollowUpRuntimeSnapshot runtime_snapshot =
+      this->lifecycle_.follow_up_runtime_snapshot(this->streaming_.load());
+  const FollowUpRuntimeDecision runtime_decision = decide_follow_up_runtime(
+      runtime_snapshot, now_ms, expected_wake_generation, expected_token);
+  if (runtime_decision.deadline_action == FollowUpDeadlineAction::EXPIRE) {
+    context.session_nonce = this->lifecycle_.session_nonce();
+    context.wake_generation = runtime_snapshot.wake_generation;
+    token = runtime_snapshot.token;
+    mic_was_open = runtime_snapshot.streaming || runtime_snapshot.mic_open;
+    expired = this->lifecycle_.expire_follow_up_deadline(
+        now_ms, context.wake_generation, token);
+    if (expired)
+      this->streaming_ = false;
+  }
+  portEXIT_CRITICAL(&this->followup_mux_);
+  if (!expired)
+    return false;
+
+  this->clear_request_follow_up_(false);
+  if (!this->wait_for_mic_send_barrier_(
+          "follow_up_timeout_mic_send_barrier_failed"))
+    return true;
+  if (mic_was_open &&
+      !this->send_mic_flush_(context.session_nonce,
+                             context.wake_generation))
+    return true;
+  this->send_interrupt_control_("follow_up_timeout", context.session_nonce,
+                                context.wake_generation);
+  ESP_LOGW(TAG, "absolute follow-up COMMIT deadline reached");
+  this->fire_phase_led_("idle");
+  return true;
 }
 
 bool VaClient::wait_for_mic_send_barrier_(const char *failure_reason) {

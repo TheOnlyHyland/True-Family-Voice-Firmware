@@ -20,7 +20,7 @@ class BuildContractTest(unittest.TestCase):
         self.assertIn("realtime: !include home-assistant-voice.realtime.yaml", factory_config)
         self.assertIn("va_client_source: esphome/components", factory_config)
         self.assertIn("name: true-family-voice", factory_config)
-        self.assertIn('firmware_version: "0.19.0"', factory_config)
+        self.assertIn('firmware_version: "0.20.0"', factory_config)
         self.assertIn('va_url: "ws://homeassistant.local:8080/"', factory_config)
         self.assertNotIn("ota_password", factory_config)
         self.assertNotIn("\napi:\n", factory_config)
@@ -29,11 +29,11 @@ class BuildContractTest(unittest.TestCase):
         self.assertNotIn("dashboard_import:", factory_config)
         self.assertNotIn("compile-only", factory_config)
         self.assertIn(
-            'va_client_source: "github://TheOnlyHyland/True-Family-Voice-Firmware@0.19.0"',
+            'va_client_source: "github://TheOnlyHyland/True-Family-Voice-Firmware@0.20.0"',
             realtime,
         )
         self.assertIn("- source: ${va_client_source}", realtime)
-        self.assertIn('version: "0.19.0"', realtime)
+        self.assertIn('version: "0.20.0"', realtime)
 
         compatibility_factory = self.read("home-assistant-voice.factory.yaml")
         self.assertEqual(compatibility_factory, factory_config)
@@ -268,9 +268,51 @@ class BuildContractTest(unittest.TestCase):
     def test_trusted_phase_and_timer_contract_is_structural(self) -> None:
         source = self.read("esphome/components/va_client/va_client.cpp")
         safety = self.read("esphome/components/va_client/follow_up_safety.h")
+        lifecycle = self.read("esphome/components/va_client/follow_up_lifecycle.h")
+        readme = self.read("README.md")
+        changelog = self.read("CHANGELOG.md")
+        install = self.read("INSTALL.md")
 
         self.assertIn(
             '{"type", "value", "session_nonce", "wake_generation"}', source
+        )
+        self.assertIn("trusted_follow_up_shape", source)
+        self.assertIn('"wake_generation", "token"', source)
+        self.assertIn(
+            '{"type":"phase","value":"listening","session_nonce":S,'
+            '"wake_generation":G,"token":T}',
+            readme,
+        )
+        self.assertRegex(
+            readme,
+            r"backend `0\.22\.0` is required for\s+any explicit follow-up",
+        )
+        self.assertIn("any tokenized `idle`", readme)
+        self.assertIn("HIL exercise of delayed timer", readme)
+        self.assertIn("all explicit\nfollow-up OPEN answers fail closed", changelog)
+        self.assertIn(
+            "compatible only for ordinary physical-wake turns", install
+        )
+        backend_restore = install.index(
+            "restore backend `0.20.6` first"
+        )
+        firmware_restart = install.index(
+            "Restart the still-installed firmware", backend_restore
+        )
+        legacy_verify = install.index(
+            "Verify that the restarted firmware has reconnected in exact legacy",
+            firmware_restart,
+        )
+        firmware_downgrade = install.index(
+            "perform the firmware rollback", legacy_verify
+        )
+        self.assertLess(backend_restore, firmware_restart)
+        self.assertLess(firmware_restart, legacy_verify)
+        self.assertLess(legacy_verify, firmware_downgrade)
+        self.assertIn("trusted session nonce blocks", install)
+        self.assertIn(
+            "restart the\nstill-installed firmware to clear its trusted session nonce",
+            changelog,
         )
         phase_handler = source[source.index('if (type == "phase")') :]
         text_handler = source[source.index("void VaClient::handle_text_") :]
@@ -312,7 +354,9 @@ class BuildContractTest(unittest.TestCase):
         )
         self.assertIn("phase_effect_plan_current_(effect_plan)", effect_handler)
         self.assertNotIn("[this, phase_copy, effect_epoch]", effect_handler)
-        self.assertIn("PhaseApplyStatus::STALE", phase_handler)
+        self.assertIn("phase_runtime_action(transition.status)", phase_handler)
+        self.assertIn("trusted_follow_up_shape, follow_up_token", phase_handler)
+        self.assertIn("decide_follow_up_phase_credential(", lifecycle)
         self.assertIn("follow_up_input_ended", source)
         self.assertIn("phase_effect_plan_is_current", source)
         self.assertIn("transition.connection_generation", source)
@@ -322,6 +366,108 @@ class BuildContractTest(unittest.TestCase):
         self.assertIn("kAbsoluteSessionMaxMs", source)
         self.assertIn("kRequestFollowUpReadyTimeoutMs = 8000", safety)
         self.assertIn("kAbsoluteSessionMaxMs = 120000", safety)
+        self.assertIn("per_answer_grant_available", safety)
+        self.assertIn("per_answer_grant_available_", lifecycle)
+        self.assertNotIn("one_shot", safety + lifecycle + source)
+        self.assertIn("kFollowUpReplayHistorySize = 256", safety)
+        self.assertIn("follow_up_token_history_count_", lifecycle)
+        self.assertIn("ready_nonce_history_count_", lifecycle)
+        self.assertIn(
+            "std::array<uint32_t, kFollowUpReplayHistorySize>", lifecycle
+        )
+        self.assertNotIn("std::vector<uint32_t>", lifecycle)
+        self.assertIn("follow_up_deadline_ms_", lifecycle)
+        self.assertIn("follow_up_deadline_reached", lifecycle)
+        self.assertIn("expire_follow_up_deadline", lifecycle)
+
+        # These narrow source checks cover only integration that cannot execute
+        # in the dependency-free host target: ESP-IDF portMUX placement and
+        # ESPHome timer installation. The decisions inside those boundaries are
+        # dynamically tested through the same helpers VaClient calls.
+        commit = source[source.index('if (type == "commit_follow_up")') :]
+        commit = commit[: commit.index('if (type == "prepare_suppress_followup")')]
+        commit_decision = commit.index("decide_follow_up_runtime(")
+        commit_lock = commit.rfind(
+            "portENTER_CRITICAL(&this->followup_mux_)", 0, commit_decision
+        )
+        commit_unlock = commit.index(
+            "portEXIT_CRITICAL(&this->followup_mux_)", commit_decision
+        )
+        timer_install = commit.index('this->set_timeout(', commit_decision)
+        self.assertGreaterEqual(commit_lock, 0)
+        self.assertLess(commit_lock, commit_decision)
+        self.assertLess(commit_decision, commit_unlock)
+        self.assertLess(commit_unlock, timer_install)
+
+        expiry = source[source.index("bool VaClient::expire_follow_up_deadline_") :]
+        expiry = expiry[: expiry.index("bool VaClient::wait_for_mic_send_barrier_")]
+        expiry_lock = expiry.index("portENTER_CRITICAL(&this->followup_mux_)")
+        expiry_decision = expiry.index("decide_follow_up_runtime(")
+        expiry_mutation = expiry.index("expire_follow_up_deadline(")
+        expiry_unlock = expiry.index("portEXIT_CRITICAL(&this->followup_mux_)")
+        expiry_barrier = expiry.index("wait_for_mic_send_barrier_(")
+        self.assertLess(expiry_lock, expiry_decision)
+        self.assertLess(expiry_decision, expiry_mutation)
+        self.assertLess(expiry_mutation, expiry_unlock)
+        self.assertLess(expiry_unlock, expiry_barrier)
+        self.assertIn("send_mic_flush_", expiry)
+        self.assertIn("send_interrupt_control_", expiry)
+
+        loop = source[source.index("void VaClient::loop()") :]
+        loop = loop[: loop.index("void VaClient::connect_()")]
+        self.assertIn("expire_follow_up_deadline_(millis(), 0, 0)", loop)
+
+        mic = source[source.index("void VaClient::on_mic_data_") :]
+        mic = mic[: mic.index("VaClient::Phase VaClient::phase_from_string_")]
+        first_decision = mic.index("decide_follow_up_runtime(")
+        first_lock = mic.rfind(
+            "portENTER_CRITICAL(&this->followup_mux_)", 0, first_decision
+        )
+        lease = mic.index("mic_send_fence_.acquire()")
+        first_unlock = mic.index(
+            "portEXIT_CRITICAL(&this->followup_mux_)", first_decision
+        )
+        second_decision = mic.index("decide_follow_up_runtime(", lease)
+        second_lock = mic.rfind(
+            "portENTER_CRITICAL(&this->followup_mux_)", lease, second_decision
+        )
+        second_unlock = mic.index(
+            "portEXIT_CRITICAL(&this->followup_mux_)", second_decision
+        )
+        send = mic.index("send_binary_bounded_(")
+        self.assertGreaterEqual(first_lock, 0)
+        self.assertLess(first_lock, first_decision)
+        self.assertLess(first_decision, lease)
+        self.assertLess(lease, first_unlock)
+        self.assertGreaterEqual(second_lock, 0)
+        self.assertLess(second_lock, second_decision)
+        self.assertLess(second_decision, second_unlock)
+        self.assertLess(second_unlock, send)
+
+        prepare = source[source.index('if (type == "request_follow_up")') :]
+        prepare = prepare[: prepare.index('if (type == "cancel_request_follow_up")')]
+        prepare_lock = prepare.index("portENTER_CRITICAL(&this->followup_mux_)")
+        prepare_mutation = prepare.index("prepare_follow_up(")
+        prepare_unlock = prepare.index("portEXIT_CRITICAL(&this->followup_mux_)")
+        prepare_send = prepare.index("send_request_follow_up_ack_(")
+        self.assertLess(prepare_lock, prepare_mutation)
+        self.assertLess(prepare_mutation, prepare_unlock)
+        self.assertLess(prepare_unlock, prepare_send)
+
+        ready = source[source.index("bool VaClient::mark_followup_ready") :]
+        ready = ready[: ready.index("void VaClient::abort_followup_mic")]
+        ready_mutation = ready.index("mark_follow_up_ready(")
+        ready_lock = ready.rfind(
+            "portENTER_CRITICAL(&this->followup_mux_)", 0, ready_mutation
+        )
+        ready_unlock = ready.index(
+            "portEXIT_CRITICAL(&this->followup_mux_)", ready_mutation
+        )
+        ready_send = ready.index("send_follow_up_ready_(")
+        self.assertGreaterEqual(ready_lock, 0)
+        self.assertLess(ready_lock, ready_mutation)
+        self.assertLess(ready_mutation, ready_unlock)
+        self.assertLess(ready_unlock, ready_send)
 
     def test_logs_do_not_emit_protocol_credentials(self) -> None:
         source = self.read("esphome/components/va_client/va_client.cpp")
@@ -494,7 +640,7 @@ class BuildContractTest(unittest.TestCase):
         pages = self.read(".github/workflows/gh-pages.yml")
         package = self.read("scripts/package-release")
 
-        self.assertEqual(version, "0.19.0")
+        self.assertEqual(version, "0.20.0")
         self.assertIn(f'version: "{version}"', realtime)
         self.assertIn("verify-version", build)
         self.assertNotIn("workflow_dispatch:", build)
@@ -553,16 +699,16 @@ class BuildContractTest(unittest.TestCase):
         self.assertIn("make-channel-manifest", promotion)
 
         exact = subprocess.run(
-            ["sh", str(ROOT / "scripts/verify-version"), "0.19.0"],
+            ["sh", str(ROOT / "scripts/verify-version"), "0.20.0"],
             cwd=ROOT,
             check=False,
             capture_output=True,
             text=True,
         )
         self.assertEqual(exact.returncode, 0, exact.stderr)
-        self.assertEqual(exact.stdout.strip(), "0.19.0")
+        self.assertEqual(exact.stdout.strip(), "0.20.0")
         wrong = subprocess.run(
-            ["sh", str(ROOT / "scripts/verify-version"), "v0.19.0"],
+            ["sh", str(ROOT / "scripts/verify-version"), "v0.20.0"],
             cwd=ROOT,
             check=False,
             capture_output=True,
@@ -664,7 +810,7 @@ class BuildContractTest(unittest.TestCase):
             self.assertNotIn("ref: main", source)
         issue_config = self.read(".github/ISSUE_TEMPLATE/config.yml")
         self.assertIn(
-            "TheOnlyHyland/True-Family-Voice-Firmware/blob/0.19.0/INSTALL.md",
+            "TheOnlyHyland/True-Family-Voice-Firmware/blob/0.20.0/INSTALL.md",
             issue_config,
         )
         self.assertNotIn("/blob/main/", issue_config)
