@@ -16,7 +16,7 @@ assert.equal(
   "/True-Family-Voice-Firmware/home-assistant-voice/",
 );
 
-for (const version of ["0.20.0", "1.0.0", "2.4.6-beta", "2.4.6-rc.3"]) {
+for (const version of ["0.20.1", "1.0.0", "2.4.6-beta", "2.4.6-rc.3"]) {
   assert.equal(isAllowedVersion(version), true);
   assert.equal(
     manifestForVersion(version),
@@ -26,7 +26,7 @@ for (const version of ["0.20.0", "1.0.0", "2.4.6-beta", "2.4.6-rc.3"]) {
 
 for (const version of [
   "",
-  "v0.20.0",
+  "v0.20.1",
   "01.2.3",
   "1.2",
   "1.2.3/../../evil",
@@ -61,14 +61,14 @@ assert.deepEqual(versionLink, {
   hidden: true,
 });
 
-assert.equal(applyVersion(documentRef, "0.20.0"), true);
-assert.equal(title.textContent, "Install True Family Voice Realtime v0.20.0");
+assert.equal(applyVersion(documentRef, "0.20.1"), true);
+assert.equal(title.textContent, "Install True Family Voice Realtime v0.20.1");
 assert.equal(
   installButton.manifest,
-  "https://firmware.esphome.io/True-Family-Voice-Firmware/home-assistant-voice/0.20.0/manifest.json",
+  "https://firmware.esphome.io/True-Family-Voice-Firmware/home-assistant-voice/0.20.1/manifest.json",
 );
-assert.equal(versionLink.textContent, "Link to v0.20.0");
-assert.equal(versionLink.href, "?version=0.20.0");
+assert.equal(versionLink.textContent, "Link to v0.20.1");
+assert.equal(versionLink.href, "?version=0.20.1");
 assert.equal(versionLink.hidden, false);
 
 const vendorDir = process.argv[2];

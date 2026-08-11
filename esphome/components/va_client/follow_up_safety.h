@@ -569,5 +569,69 @@ inline bool should_accept_follow_up(const FollowUpAdmissionContext &context) {
          !context.competing_control_active && !context.active_request && !context.callback_in_flight;
 }
 
+enum class GracefulControlStage : uint8_t { PREPARE = 0, COMMIT, CANCEL };
+enum class GracefulControlAction : uint8_t { IGNORE = 0, ACCEPT, SETTLE_CURRENT };
+
+struct GracefulControlContext {
+  GracefulControlStage stage{GracefulControlStage::PREPARE};
+  bool message_shape_valid{false};
+  uint32_t token{0};
+  uint32_t session_nonce{0};
+  uint32_t wake_generation{0};
+  uint32_t prepared_token{0};
+  uint32_t committed_token{0};
+  uint32_t owner_session_nonce{0};
+  uint32_t owner_wake_generation{0};
+  uint32_t active_session_nonce{0};
+  uint32_t active_wake_generation{0};
+  bool active_wake{false};
+  bool stage_allowed{false};
+};
+
+inline GracefulControlAction decide_graceful_control(
+    const GracefulControlContext &context) {
+  // Stage failures may fail closed only when the token proves ownership.
+  // Cancellation additionally requires an exact shape; malformed cancel is stale.
+  const bool control_values_valid =
+      context.token != 0 && context.token <= kProtocolTokenMax &&
+      context.session_nonce != 0 &&
+      context.session_nonce <= kProtocolTokenMax &&
+      context.wake_generation != 0 &&
+      context.wake_generation <= kProtocolTokenMax;
+  const bool owner_is_empty =
+      context.prepared_token == 0 && context.committed_token == 0 &&
+      context.owner_session_nonce == 0 && context.owner_wake_generation == 0;
+  const bool matches_active_wake =
+      control_values_valid && context.active_wake &&
+      context.session_nonce == context.active_session_nonce &&
+      context.wake_generation == context.active_wake_generation;
+  const bool targets_current_owner =
+      control_values_valid &&
+      (context.prepared_token == context.token ||
+       context.committed_token == context.token) &&
+      context.session_nonce == context.owner_session_nonce &&
+      context.wake_generation == context.owner_wake_generation;
+  switch (context.stage) {
+    case GracefulControlStage::PREPARE:
+      if (context.message_shape_valid && owner_is_empty &&
+          matches_active_wake && context.stage_allowed)
+        return GracefulControlAction::ACCEPT;
+      return targets_current_owner ? GracefulControlAction::SETTLE_CURRENT
+                                   : GracefulControlAction::IGNORE;
+    case GracefulControlStage::COMMIT:
+      if (context.message_shape_valid && targets_current_owner &&
+          context.prepared_token == context.token &&
+          context.committed_token == 0 && context.stage_allowed)
+        return GracefulControlAction::ACCEPT;
+      return targets_current_owner ? GracefulControlAction::SETTLE_CURRENT
+                                   : GracefulControlAction::IGNORE;
+    case GracefulControlStage::CANCEL:
+      return context.message_shape_valid && targets_current_owner
+                 ? GracefulControlAction::SETTLE_CURRENT
+                 : GracefulControlAction::IGNORE;
+  }
+  return GracefulControlAction::IGNORE;
+}
+
 }  // namespace va_client
 }  // namespace esphome

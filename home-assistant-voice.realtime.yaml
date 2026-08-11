@@ -4,7 +4,7 @@
 # (pulled from GitHub), streaming audio to the OpenAI Realtime backend add-on.
 #
 # This config is pulled as a remote ESPHome `packages:` include from a small
-# per-device stub. Its immutable `0.20.0` refs do not auto-discover later releases;
+# per-device stub. Its immutable `0.20.1` refs do not auto-discover later releases;
 # an update requires deliberate ref advancement or re-adoption. The
 # stub provides the device identity + secrets as SUBSTITUTIONS (a remote package
 # can't use !secret):
@@ -79,7 +79,7 @@ substitutions:
   # (device→add-on WebSocket needs no auth token; it's a LAN-local service.)
   # Published packages resolve va_client from the matching immutable release.
   # The generic factory target overrides this with the checked-out source.
-  va_client_source: "github://TheOnlyHyland/True-Family-Voice-Firmware@0.20.0"
+  va_client_source: "github://TheOnlyHyland/True-Family-Voice-Firmware@0.20.1"
 
 esphome:
   name: ${name}
@@ -90,7 +90,7 @@ esphome:
   # each release. Adopted devices compile only an explicitly selected tag.
   project:
     name: "true_tech_solutions.true_family_voice"
-    version: "0.20.0"
+    version: "0.20.1"
   min_version: 2026.5.0
   on_boot:
     priority: 375

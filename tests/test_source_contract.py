@@ -20,7 +20,7 @@ class BuildContractTest(unittest.TestCase):
         self.assertIn("realtime: !include home-assistant-voice.realtime.yaml", factory_config)
         self.assertIn("va_client_source: esphome/components", factory_config)
         self.assertIn("name: true-family-voice", factory_config)
-        self.assertIn('firmware_version: "0.20.0"', factory_config)
+        self.assertIn('firmware_version: "0.20.1"', factory_config)
         self.assertIn('va_url: "ws://homeassistant.local:8080/"', factory_config)
         self.assertNotIn("ota_password", factory_config)
         self.assertNotIn("\napi:\n", factory_config)
@@ -29,11 +29,11 @@ class BuildContractTest(unittest.TestCase):
         self.assertNotIn("dashboard_import:", factory_config)
         self.assertNotIn("compile-only", factory_config)
         self.assertIn(
-            'va_client_source: "github://TheOnlyHyland/True-Family-Voice-Firmware@0.20.0"',
+            'va_client_source: "github://TheOnlyHyland/True-Family-Voice-Firmware@0.20.1"',
             realtime,
         )
         self.assertIn("- source: ${va_client_source}", realtime)
-        self.assertIn('version: "0.20.0"', realtime)
+        self.assertIn('version: "0.20.1"', realtime)
 
         compatibility_factory = self.read("home-assistant-voice.factory.yaml")
         self.assertEqual(compatibility_factory, factory_config)
@@ -265,6 +265,269 @@ class BuildContractTest(unittest.TestCase):
         self.assertLess(stop, alternate)
         self.assertLess(alternate, ordinary_press)
 
+    def test_graceful_commit_locally_enters_existing_idle_drain(self) -> None:
+        source = self.read("esphome/components/va_client/va_client.cpp")
+        safety = self.read("esphome/components/va_client/follow_up_safety.h")
+
+        control_context = source[
+            source.index(
+                "GracefulControlContext VaClient::graceful_control_context_"
+            ) :
+        ]
+        control_context = control_context[
+            : control_context.index("bool VaClient::clear_graceful_close_owner_")
+        ]
+        self.assertIn(
+            '{"type", "token", "session_nonce", "wake_generation"}',
+            control_context,
+        )
+        for field in (
+            'message.get_uint("token", context.token)',
+            'message.get_uint("session_nonce", context.session_nonce)',
+            'message.get_uint("wake_generation", context.wake_generation)',
+            "context.prepared_token =",
+            "context.committed_token =",
+            "context.owner_session_nonce =",
+            "context.owner_wake_generation =",
+            "context.active_session_nonce = this->lifecycle_.session_nonce()",
+            "context.active_wake_generation = this->lifecycle_.wake_generation()",
+            "context.active_wake = this->lifecycle_.active_wake()",
+        ):
+            self.assertIn(field, control_context)
+        self.assertIn("matches_active_wake", safety)
+        self.assertIn("context.session_nonce == context.owner_session_nonce", safety)
+        self.assertIn(
+            "context.wake_generation == context.owner_wake_generation", safety
+        )
+
+        prepare = source[source.index('if (type == "prepare_suppress_followup")') :]
+        prepare = prepare[: prepare.index('if (type == "commit_suppress_followup")')]
+        self.assertIn("GracefulControlStage::PREPARE", prepare)
+        self.assertIn("graceful_control_context_", prepare)
+        prepare_accept = prepare.index(
+            "if (action == GracefulControlAction::ACCEPT)"
+        )
+        prepare_settle = prepare.index(
+            "} else if (action == GracefulControlAction::SETTLE_CURRENT)",
+            prepare_accept,
+        )
+        prepare_ignore = prepare.index("} else {", prepare_settle)
+        accepted_prepare = prepare[prepare_accept:prepare_settle]
+        settled_prepare = prepare[prepare_settle:prepare_ignore]
+        ignored_prepare = prepare[prepare_ignore:]
+        self.assertIn(
+            'revoke_followup_("graceful_prepare", false)', accepted_prepare
+        )
+        revoke_success = accepted_prepare.index(
+            'if (this->revoke_followup_("graceful_prepare", false))'
+        )
+        owner_session = accepted_prepare.index(
+            "this->graceful_close_owner_session_nonce_ = control.session_nonce"
+        )
+        owner_wake = accepted_prepare.index(
+            "this->graceful_close_owner_wake_generation_ = control.wake_generation"
+        )
+        prepared_token = accepted_prepare.index(
+            "this->graceful_close_prepared_token_ = control.token"
+        )
+        self.assertLess(owner_session, owner_wake)
+        self.assertLess(owner_wake, prepared_token)
+        self.assertLess(revoke_success, owner_session)
+        self.assertIn("accepted = false", accepted_prepare)
+        self.assertIn(
+            'revoke_followup_("graceful_prepare_rejected", true)',
+            settled_prepare,
+        )
+        self.assertNotIn("revoke_followup_", ignored_prepare)
+        self.assertNotIn("set_phase_", ignored_prepare)
+        self.assertNotIn("fire_phase_led_", ignored_prepare)
+        self.assertNotIn("lifecycle_", ignored_prepare)
+        self.assertNotIn("streaming_", ignored_prepare)
+
+        commit = source[source.index('if (type == "commit_suppress_followup")') :]
+        commit = commit[: commit.index('if (type == "cancel_suppress_followup")')]
+        self.assertIn("GracefulControlStage::COMMIT", commit)
+        self.assertIn("graceful_control_context_", commit)
+        commit_accept = commit.index(
+            "if (action == GracefulControlAction::ACCEPT)"
+        )
+        commit_settle = commit.index(
+            "} else if (action == GracefulControlAction::SETTLE_CURRENT)",
+            commit_accept,
+        )
+        commit_ignore = commit.index("} else {", commit_settle)
+        accepted = commit[commit_accept:commit_settle]
+        settled = commit[commit_settle:commit_ignore]
+        ignored = commit[commit_ignore:]
+        token_commit = accepted.index("this->graceful_close_token_ = control.token")
+        local_idle = accepted.index('this->set_phase_("idle")')
+        commit_ack = commit.index('send_graceful_close_ack_("committed"')
+        self.assertLess(token_commit, local_idle)
+        self.assertLess(local_idle, commit_ack)
+        self.assertEqual(commit.count('set_phase_("idle")'), 1)
+        self.assertNotIn('set_phase_("idle")', settled)
+        self.assertNotIn('set_phase_("idle")', ignored)
+        self.assertIn(
+            'revoke_followup_("graceful_commit_rejected", true)', settled
+        )
+        self.assertNotIn("revoke_followup_", ignored)
+        self.assertNotIn("fire_phase_led_", ignored)
+        self.assertNotIn("lifecycle_", ignored)
+        self.assertNotIn("streaming_", ignored)
+        self.assertNotIn('fire_phase_led_("idle")', commit)
+
+        graceful_idle = source[
+            source.index(
+                "} else if (this->graceful_close_token_.load() != 0) {"
+            ) :
+        ]
+        graceful_idle = graceful_idle[
+            : graceful_idle.index(
+                "} else if (this->request_follow_up_token_.load() != 0"
+            )
+        ]
+        for state_change in (
+            "this->streaming_ = false",
+            "this->followup_pending_ = true",
+            "this->waiting_for_speaker_stop_ = false",
+            "this->request_follow_up_pending_ = false",
+            "this->followup_armed_ = false",
+            "this->idle_emit_pending_ = true",
+            "return;",
+        ):
+            self.assertIn(state_change, graceful_idle)
+
+        loop = source[source.index("void VaClient::loop()") :]
+        loop = loop[: loop.index("void VaClient::connect_()")]
+        ring_empty = loop.index(
+            "if (this->followup_pending_ && this->audio_fill_snapshot_() == 0"
+        )
+        queued_audio_drain = loop.index("this->audio_fill_ -= accepted")
+        drain_gate = loop.index("GenerationEffectGate> drain_effect_guard")
+        speaker_drain = loop.index("const bool speaker_drained =", ring_empty)
+        graceful_tail = loop.index(
+            'this->set_timeout("va_graceful_close"', speaker_drain
+        )
+        idle_emit = loop.index("this->open_followup_window_(0);", graceful_tail)
+        self.assertLess(queued_audio_drain, ring_empty)
+        self.assertLess(drain_gate, ring_empty)
+        self.assertLess(ring_empty, speaker_drain)
+        self.assertLess(speaker_drain, graceful_tail)
+        self.assertLess(graceful_tail, idle_emit)
+        self.assertIn("graceful_close_owner_session_nonce_", loop)
+        self.assertIn("graceful_close_owner_wake_generation_", loop)
+        self.assertIn("clear_graceful_close_owner_()", loop)
+
+        owner_clear = source[
+            source.index("bool VaClient::clear_graceful_close_owner_()") :
+        ]
+        owner_clear = owner_clear[
+            : owner_clear.index("bool VaClient::settle_graceful_close_()")
+        ]
+        for state_change in (
+            "this->graceful_close_prepared_token_.exchange(0)",
+            "this->graceful_close_token_.exchange(0)",
+            "this->graceful_close_owner_session_nonce_.exchange(0)",
+            "this->graceful_close_owner_wake_generation_.exchange(0)",
+        ):
+            self.assertIn(state_change, owner_clear)
+
+        settlement = source[source.index("bool VaClient::settle_graceful_close_()") :]
+        settlement = settlement[
+            : settlement.index("void VaClient::clear_request_follow_up_")
+        ]
+        for state_change in (
+            "this->clear_graceful_close_owner_()",
+            'this->cancel_timeout("va_graceful_close")',
+            "this->request_follow_up_token_ = 0",
+            "this->request_follow_up_pending_ = false",
+            "this->request_follow_up_callback_in_flight_ = false",
+            "this->followup_pending_ = false",
+            "this->waiting_for_speaker_stop_ = false",
+            "this->followup_armed_ = false",
+            "this->idle_emit_pending_ = false",
+            "this->streaming_ = false",
+            "this->lifecycle_.on_phase_idle()",
+            "this->current_phase_.store(static_cast<uint8_t>(Phase::IDLE))",
+            'this->fire_phase_led_("idle")',
+        ):
+            self.assertIn(state_change, settlement)
+        self.assertNotIn("open_followup_window_", settlement)
+        no_owner = settlement.index("if (!this->clear_graceful_close_owner_())")
+        no_owner_return = settlement.index("return false;", no_owner)
+        cancel_tail = settlement.index('this->cancel_timeout("va_graceful_close")')
+        self.assertLess(no_owner_return, cancel_tail)
+
+        clear = source[source.index("void VaClient::clear_request_follow_up_") :]
+        clear = clear[: clear.index("void VaClient::cancel_session_timers_")]
+        self.assertIn("settle_graceful_close_()", clear)
+
+        revoke = source[source.index("bool VaClient::revoke_followup_") :]
+        revoke = revoke[: revoke.index("void VaClient::revoke_followup()")]
+        self.assertIn("clear_request_follow_up_(false)", revoke)
+
+        cancel = source[source.index('if (type == "cancel_suppress_followup")') :]
+        cancel = cancel[: cancel.index('if (type == "ack")')]
+        self.assertIn("GracefulControlStage::CANCEL", cancel)
+        cancel_settle = cancel.index(
+            "if (action == GracefulControlAction::SETTLE_CURRENT)"
+        )
+        cancel_ignore = cancel.index("} else {", cancel_settle)
+        settled_cancel = cancel[cancel_settle:cancel_ignore]
+        ignored_cancel = cancel[cancel_ignore:]
+        self.assertIn(
+            'revoke_followup_("graceful_cancel", false)', settled_cancel
+        )
+        self.assertNotIn("revoke_followup_", ignored_cancel)
+        self.assertNotIn("set_phase_", ignored_cancel)
+        self.assertNotIn("fire_phase_led_", ignored_cancel)
+        self.assertNotIn("lifecycle_", ignored_cancel)
+        self.assertNotIn("streaming_", ignored_cancel)
+
+        ack = source[source.index("void VaClient::send_graceful_close_ack_") :]
+        ack = ack[: ack.index("void VaClient::fire_phase_led_")]
+        ack_fields = (
+            "context.token",
+            "context.session_nonce",
+            "context.wake_generation",
+            "ack += accepted ?",
+        )
+        ack_positions = [ack.index(field) for field in ack_fields]
+        self.assertEqual(ack_positions, sorted(ack_positions))
+        self.assertNotIn("control_context_()", ack)
+        self.assertNotIn("legacy_zero_mode_()", ack)
+
+        mute = source[source.index("void VaClient::revoke_for_mute()") :]
+        mute = mute[: mute.index("void VaClient::release_mute()")]
+        self.assertIn("clear_request_follow_up_(false)", mute)
+
+        announcement = source[
+            source.index("void VaClient::set_announcement_active(bool active)") :
+        ]
+        announcement = announcement[
+            : announcement.index("void VaClient::send_graceful_close_ack_")
+        ]
+        self.assertIn("graceful_close_prepared_token_.load() != 0", announcement)
+        self.assertIn("graceful_close_token_.load() != 0", announcement)
+        self.assertIn("graceful_close_owner_session_nonce_.load() != 0", announcement)
+        self.assertIn(
+            "graceful_close_owner_wake_generation_.load() != 0", announcement
+        )
+        self.assertIn("clear_request_follow_up_(false)", announcement)
+
+        stop = source[source.index("void VaClient::send_interrupt()") :]
+        self.assertIn("clear_request_follow_up_(false)", stop)
+        self.assertNotIn("graceful_close_prepared_token_ = 0", stop)
+        self.assertNotIn("graceful_close_token_ = 0", stop)
+        self.assertNotIn("graceful_close_owner_session_nonce_ = 0", stop)
+        self.assertNotIn("graceful_close_owner_wake_generation_ = 0", stop)
+
+        next_wake = source[source.index("uint32_t VaClient::prepare_local_wake()") :]
+        next_wake = next_wake[: next_wake.index("bool VaClient::pending_wake_is_safe")]
+        revoke_old = next_wake.index('revoke_followup_("new_wake"')
+        prepare_new = next_wake.index("lifecycle_.prepare_local_wake()")
+        self.assertLess(revoke_old, prepare_new)
+
     def test_trusted_phase_and_timer_contract_is_structural(self) -> None:
         source = self.read("esphome/components/va_client/va_client.cpp")
         safety = self.read("esphome/components/va_client/follow_up_safety.h")
@@ -286,6 +549,20 @@ class BuildContractTest(unittest.TestCase):
         self.assertRegex(
             readme,
             r"backend `0\.22\.0` is required for\s+any explicit follow-up",
+        )
+        self.assertIn(
+            'backend `0.22.5` binds each model-selected graceful close', readme
+        )
+        self.assertIn(
+            '{"type":"prepare_suppress_followup","token":C,'
+            '"session_nonce":S,"wake_generation":G}',
+            readme,
+        )
+        self.assertIn(
+            '{"type":"suppress_followup_ack","stage":"prepared",'
+            '"token":C,"session_nonce":S,"wake_generation":G,'
+            '"accepted":true}',
+            readme,
         )
         self.assertIn("any tokenized `idle`", readme)
         self.assertIn("HIL exercise of delayed timer", readme)
@@ -640,7 +917,7 @@ class BuildContractTest(unittest.TestCase):
         pages = self.read(".github/workflows/gh-pages.yml")
         package = self.read("scripts/package-release")
 
-        self.assertEqual(version, "0.20.0")
+        self.assertEqual(version, "0.20.1")
         self.assertIn(f'version: "{version}"', realtime)
         self.assertIn("verify-version", build)
         self.assertNotIn("workflow_dispatch:", build)
@@ -700,16 +977,16 @@ class BuildContractTest(unittest.TestCase):
         self.assertIn("make-channel-manifest", promotion)
 
         exact = subprocess.run(
-            ["sh", str(ROOT / "scripts/verify-version"), "0.20.0"],
+            ["sh", str(ROOT / "scripts/verify-version"), "0.20.1"],
             cwd=ROOT,
             check=False,
             capture_output=True,
             text=True,
         )
         self.assertEqual(exact.returncode, 0, exact.stderr)
-        self.assertEqual(exact.stdout.strip(), "0.20.0")
+        self.assertEqual(exact.stdout.strip(), "0.20.1")
         wrong = subprocess.run(
-            ["sh", str(ROOT / "scripts/verify-version"), "v0.20.0"],
+            ["sh", str(ROOT / "scripts/verify-version"), "v0.20.1"],
             cwd=ROOT,
             check=False,
             capture_output=True,
@@ -817,7 +1094,7 @@ class BuildContractTest(unittest.TestCase):
             self.assertNotIn("ref: main", source)
         issue_config = self.read(".github/ISSUE_TEMPLATE/config.yml")
         self.assertIn(
-            "TheOnlyHyland/True-Family-Voice-Firmware/blob/0.20.0/INSTALL.md",
+            "TheOnlyHyland/True-Family-Voice-Firmware/blob/0.20.1/INSTALL.md",
             issue_config,
         )
         self.assertNotIn("/blob/main/", issue_config)

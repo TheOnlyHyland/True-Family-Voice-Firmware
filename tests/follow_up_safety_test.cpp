@@ -184,6 +184,241 @@ static void test_follow_up_phase_credential_contract() {
   }
 }
 
+static void test_graceful_prepare_revocation_makes_terminal_idle_stale() {
+  constexpr uint32_t kSessionNonce = 7000;
+  FollowUpLifecycle lifecycle;
+  const uint32_t wake_generation =
+      start_trusted_wake(lifecycle, kSessionNonce);
+  assert(apply_initial_phase(
+             lifecycle, PilotPhase::LISTENING, kSessionNonce,
+             wake_generation)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(apply_initial_phase(
+             lifecycle, PilotPhase::THINKING, kSessionNonce,
+             wake_generation)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(apply_initial_phase(
+             lifecycle, PilotPhase::REPLYING, kSessionNonce,
+             wake_generation)
+             .status == PhaseApplyStatus::APPLIED);
+
+  // Accepted graceful PREPARE closes lifecycle ownership before COMMIT.
+  lifecycle.revoke();
+  assert(!lifecycle.active_wake());
+  assert(!lifecycle.mic_open());
+
+  const auto terminal_idle = apply_initial_phase(
+      lifecycle, PilotPhase::IDLE, kSessionNonce, wake_generation);
+  assert(terminal_idle.status == PhaseApplyStatus::STALE);
+  assert(phase_runtime_action(terminal_idle.status) ==
+         PhaseRuntimeAction::IGNORE);
+  assert(lifecycle.phase() == PilotPhase::REPLYING);
+  assert(!lifecycle.active_wake());
+  assert(!lifecycle.mic_open());
+}
+
+static void test_graceful_control_admission_is_owner_bound() {
+  constexpr uint32_t kCurrentToken = 81;
+  constexpr uint32_t kStaleToken = 80;
+  constexpr uint32_t kSessionNonce = 8100;
+  constexpr uint32_t kWakeGeneration = 8;
+
+  GracefulControlContext control;
+  control.stage = GracefulControlStage::PREPARE;
+  control.message_shape_valid = true;
+  control.token = kCurrentToken;
+  control.session_nonce = kSessionNonce;
+  control.wake_generation = kWakeGeneration;
+  control.active_session_nonce = kSessionNonce;
+  control.active_wake_generation = kWakeGeneration;
+  control.active_wake = true;
+  control.stage_allowed = true;
+  assert(decide_graceful_control(control) == GracefulControlAction::ACCEPT);
+
+  control.wake_generation = kWakeGeneration - 1;
+  assert(decide_graceful_control(control) == GracefulControlAction::IGNORE);
+  control.wake_generation = kWakeGeneration;
+  control.session_nonce = kSessionNonce - 1;
+  assert(decide_graceful_control(control) == GracefulControlAction::IGNORE);
+
+  control.session_nonce = kSessionNonce;
+  control.message_shape_valid = false;
+  control.prepared_token = kCurrentToken;
+  control.owner_session_nonce = kSessionNonce;
+  control.owner_wake_generation = kWakeGeneration;
+  assert(decide_graceful_control(control) ==
+         GracefulControlAction::SETTLE_CURRENT);
+  control.message_shape_valid = true;
+  control.token = kStaleToken;
+  assert(decide_graceful_control(control) == GracefulControlAction::IGNORE);
+
+  control.stage = GracefulControlStage::COMMIT;
+  control.token = kCurrentToken;
+  control.active_wake = false;
+  assert(decide_graceful_control(control) == GracefulControlAction::ACCEPT);
+  control.wake_generation = kWakeGeneration - 1;
+  assert(decide_graceful_control(control) == GracefulControlAction::IGNORE);
+  control.wake_generation = kWakeGeneration;
+  control.session_nonce = kSessionNonce - 1;
+  assert(decide_graceful_control(control) == GracefulControlAction::IGNORE);
+  control.session_nonce = kSessionNonce;
+  control.stage_allowed = false;
+  assert(decide_graceful_control(control) ==
+         GracefulControlAction::SETTLE_CURRENT);
+  control.stage_allowed = true;
+  control.message_shape_valid = false;
+  assert(decide_graceful_control(control) ==
+         GracefulControlAction::SETTLE_CURRENT);
+  control.message_shape_valid = true;
+  control.prepared_token = 0;
+  control.committed_token = kCurrentToken;
+  assert(decide_graceful_control(control) ==
+         GracefulControlAction::SETTLE_CURRENT);
+
+  control.stage = GracefulControlStage::CANCEL;
+  assert(decide_graceful_control(control) ==
+         GracefulControlAction::SETTLE_CURRENT);
+  control.wake_generation = kWakeGeneration - 1;
+  assert(decide_graceful_control(control) == GracefulControlAction::IGNORE);
+  control.wake_generation = kWakeGeneration;
+  control.message_shape_valid = false;
+  assert(decide_graceful_control(control) == GracefulControlAction::IGNORE);
+}
+
+static void test_stale_graceful_controls_preserve_replacement_wake() {
+  constexpr uint32_t kSessionNonce = 7200;
+  constexpr uint32_t kStaleToken = 91;
+  FollowUpLifecycle lifecycle;
+  const uint32_t old_wake = start_trusted_wake(lifecycle, kSessionNonce);
+  assert(apply_initial_phase(
+             lifecycle, PilotPhase::LISTENING, kSessionNonce, old_wake)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(apply_initial_phase(
+             lifecycle, PilotPhase::THINKING, kSessionNonce, old_wake)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(apply_initial_phase(
+             lifecycle, PilotPhase::REPLYING, kSessionNonce, old_wake)
+             .status == PhaseApplyStatus::APPLIED);
+
+  lifecycle.revoke();
+  lifecycle.on_phase_idle();
+  const uint32_t reservation = lifecycle.prepare_local_wake();
+  assert(reservation != 0);
+  assert(lifecycle.commit_local_wake(reservation));
+  const uint32_t replacement_wake = lifecycle.wake_generation();
+  assert(replacement_wake != old_wake);
+  assert(lifecycle.phase() == PilotPhase::WAITING);
+  assert(lifecycle.active_wake());
+  assert(lifecycle.mic_open());
+  const uint32_t immediate_effect_epoch = lifecycle.effect_epoch();
+
+  GracefulControlContext stale_control;
+  stale_control.message_shape_valid = true;
+  stale_control.token = kStaleToken;
+  stale_control.session_nonce = kSessionNonce;
+  stale_control.wake_generation = old_wake;
+  stale_control.active_session_nonce = kSessionNonce;
+  stale_control.active_wake_generation = replacement_wake;
+  stale_control.active_wake = true;
+  stale_control.stage_allowed = false;
+  stale_control.stage = GracefulControlStage::CANCEL;
+  assert(decide_graceful_control(stale_control) ==
+         GracefulControlAction::IGNORE);
+  stale_control.stage = GracefulControlStage::COMMIT;
+  assert(decide_graceful_control(stale_control) ==
+         GracefulControlAction::IGNORE);
+  stale_control.stage = GracefulControlStage::PREPARE;
+  assert(decide_graceful_control(stale_control) ==
+         GracefulControlAction::IGNORE);
+  assert(lifecycle.wake_generation() == replacement_wake);
+  assert(lifecycle.effect_epoch_matches(immediate_effect_epoch));
+  assert(lifecycle.phase() == PilotPhase::WAITING);
+  assert(lifecycle.active_wake());
+  assert(lifecycle.mic_open());
+
+  assert(lifecycle.on_phase_listening());
+  const uint32_t listening_effect_epoch = lifecycle.effect_epoch();
+  stale_control.stage = GracefulControlStage::CANCEL;
+  assert(decide_graceful_control(stale_control) ==
+         GracefulControlAction::IGNORE);
+  stale_control.stage = GracefulControlStage::COMMIT;
+  assert(decide_graceful_control(stale_control) ==
+         GracefulControlAction::IGNORE);
+  assert(lifecycle.wake_generation() == replacement_wake);
+  assert(lifecycle.effect_epoch_matches(listening_effect_epoch));
+  assert(lifecycle.phase() == PilotPhase::LISTENING);
+  assert(lifecycle.active_wake());
+  assert(lifecycle.mic_open());
+}
+
+static void test_current_graceful_owner_revocations_settle_and_preserve_next_wake() {
+  enum class GracefulRevocation {
+    MUTE,
+    MATCHING_CANCEL,
+    CURRENT_OWNER_REJECTED_COMMIT,
+    COMMITTED_OWNER_REPLAYED_COMMIT,
+    STOP,
+  };
+  const std::array<GracefulRevocation, 5> revocation_classes = {
+      GracefulRevocation::MUTE,
+      GracefulRevocation::MATCHING_CANCEL,
+      GracefulRevocation::CURRENT_OWNER_REJECTED_COMMIT,
+      GracefulRevocation::COMMITTED_OWNER_REPLAYED_COMMIT,
+      GracefulRevocation::STOP,
+  };
+  uint32_t index = 0;
+  for (const GracefulRevocation revocation : revocation_classes) {
+    FollowUpLifecycle lifecycle;
+    const uint32_t session_nonce = 7100 + index++;
+    const uint32_t old_wake = start_trusted_wake(lifecycle, session_nonce);
+    assert(apply_initial_phase(
+               lifecycle, PilotPhase::LISTENING, session_nonce, old_wake)
+               .status == PhaseApplyStatus::APPLIED);
+    assert(apply_initial_phase(
+               lifecycle, PilotPhase::THINKING, session_nonce, old_wake)
+               .status == PhaseApplyStatus::APPLIED);
+    assert(apply_initial_phase(
+               lifecycle, PilotPhase::REPLYING, session_nonce, old_wake)
+               .status == PhaseApplyStatus::APPLIED);
+
+    switch (revocation) {
+      case GracefulRevocation::MUTE:
+        lifecycle.set_muted(true);
+        break;
+      case GracefulRevocation::MATCHING_CANCEL:
+      case GracefulRevocation::CURRENT_OWNER_REJECTED_COMMIT:
+      case GracefulRevocation::COMMITTED_OWNER_REPLAYED_COMMIT:
+        lifecycle.revoke();
+        break;
+      case GracefulRevocation::STOP:
+        lifecycle.stop();
+        break;
+    }
+    lifecycle.on_phase_idle();
+    assert(lifecycle.phase() == PilotPhase::IDLE);
+    assert(!lifecycle.active_wake());
+    assert(!lifecycle.mic_open());
+
+    // Duplicate settlement is closed and idempotent.
+    lifecycle.on_phase_idle();
+    assert(lifecycle.phase() == PilotPhase::IDLE);
+    assert(!lifecycle.active_wake());
+    assert(!lifecycle.mic_open());
+    const uint32_t settled_effect_epoch = lifecycle.effect_epoch();
+
+    if (revocation == GracefulRevocation::MUTE)
+      lifecycle.set_muted(false);
+    const uint32_t reservation = lifecycle.prepare_local_wake();
+    assert(reservation != 0);
+    assert(!lifecycle.effect_epoch_matches(settled_effect_epoch));
+    assert(lifecycle.commit_local_wake(reservation));
+    assert(lifecycle.wake_generation() != old_wake);
+    assert(lifecycle.phase() == PilotPhase::WAITING);
+    assert(lifecycle.active_wake());
+    assert(lifecycle.mic_open());
+  }
+}
+
 static void test_runtime_deadline_and_mic_decisions() {
   FollowUpRuntimeSnapshot physical;
   physical.mic_open = true;
@@ -623,7 +858,7 @@ static void test_tokenized_idle_is_invalid_and_tokenless_idle_is_terminal() {
       kToken, kSessionNonce, 31101, 0, 1000));
 
   // Backend 0.21.x sends tokenless progression and therefore cannot complete
-  // any explicit OPEN answer with firmware 0.20.0.
+  // any explicit OPEN answer with firmware 0.20.1.
   for (const PilotPhase target : std::array<PilotPhase, 3>{
            PilotPhase::LISTENING,
            PilotPhase::THINKING,
@@ -1368,6 +1603,10 @@ int main() {
 
   test_strict_flat_json();
   test_follow_up_phase_credential_contract();
+  test_graceful_prepare_revocation_makes_terminal_idle_stale();
+  test_graceful_control_admission_is_owner_bound();
+  test_stale_graceful_controls_preserve_replacement_wake();
+  test_current_graceful_owner_revocations_settle_and_preserve_next_wake();
   test_runtime_deadline_and_mic_decisions();
   test_listening_requires_owned_open_mic();
   test_complete_two_phase_lifecycle();

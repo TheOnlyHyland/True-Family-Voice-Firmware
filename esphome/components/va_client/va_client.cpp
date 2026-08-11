@@ -286,6 +286,10 @@ void VaClient::loop() {
   // Fallback: kSpeakerStopTimeoutMs (3 s). If something wedges and the
   // speaker never reports STOPPED, we still progress so the LED doesn't
   // lock in `replying`.
+  if (!this->followup_pending_ && !this->waiting_for_speaker_stop_)
+    return;
+  std::lock_guard<GenerationEffectGate> drain_effect_guard(
+      this->generation_effect_gate_);
   if (this->followup_pending_ && this->audio_fill_snapshot_() == 0 &&
       !this->waiting_for_speaker_stop_) {
     this->waiting_for_speaker_stop_ = true;
@@ -339,10 +343,23 @@ void VaClient::loop() {
         this->followup_armed_ = false;
         const uint32_t tail_delay = this->followup_open_delay_ms_;
         const ControlContext graceful_context = this->control_context_();
+        const uint32_t owner_session_nonce =
+            this->graceful_close_owner_session_nonce_.load();
+        const uint32_t owner_wake_generation =
+            this->graceful_close_owner_wake_generation_.load();
+        if (owner_session_nonce == 0 || owner_wake_generation == 0 ||
+            graceful_context.session_nonce != owner_session_nonce ||
+            graceful_context.wake_generation != owner_wake_generation) {
+          ESP_LOGW(TAG, "stale graceful close owner discarded before tail");
+          this->clear_graceful_close_owner_();
+          this->idle_emit_pending_ = false;
+          return;
+        }
         ESP_LOGI(TAG, "graceful close — final buffers drained; idle in %u ms",
                  (unsigned) tail_delay);
         this->set_timeout("va_graceful_close", tail_delay,
-                          [this, graceful_close_token, graceful_context]() {
+                          [this, graceful_close_token, graceful_context,
+                           owner_session_nonce, owner_wake_generation]() {
           std::lock_guard<GenerationEffectGate> effect_guard(
               this->generation_effect_gate_);
           const ControlContext current_context = this->control_context_();
@@ -350,9 +367,13 @@ void VaClient::loop() {
               current_context.wake_generation != graceful_context.wake_generation ||
               current_context.effect_epoch != graceful_context.effect_epoch)
             return;
-          uint32_t expected = graceful_close_token;
-          if (!this->graceful_close_token_.compare_exchange_strong(expected, 0))
+          if (this->graceful_close_token_.load() != graceful_close_token ||
+              this->graceful_close_owner_session_nonce_.load() !=
+                  owner_session_nonce ||
+              this->graceful_close_owner_wake_generation_.load() !=
+                  owner_wake_generation)
             return;
+          this->clear_graceful_close_owner_();
           ESP_LOGI(TAG, "graceful close complete — follow-up suppressed");
           this->open_followup_window_(0);
         });
@@ -786,6 +807,8 @@ void VaClient::handle_text_(const char *data, size_t len) {
                microphone_ready &&
                this->graceful_close_prepared_token_.load() == 0 &&
                this->graceful_close_token_.load() == 0 &&
+               this->graceful_close_owner_session_nonce_.load() == 0 &&
+               this->graceful_close_owner_wake_generation_.load() == 0 &&
                this->lifecycle_.prepare_follow_up(token, session_nonce);
     if (accepted) {
       this->request_follow_up_token_ = token;
@@ -936,57 +959,71 @@ void VaClient::handle_text_(const char *data, size_t len) {
   }
 
   if (type == "prepare_suppress_followup") {
-    uint32_t token = 0;
-    const bool has_token = message.has_exact({"type", "token"}) &&
-                           message.get_uint("token", token) && token != 0;
     const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
-    const bool accepted = has_token &&
-                           this->request_follow_up_token_.load() == 0 &&
-                           (phase_now == Phase::THINKING || phase_now == Phase::REPLYING);
-    if (accepted) {
-      this->revoke_followup_("graceful_prepare", false);
-      this->graceful_close_prepared_token_ = token;
-      ESP_LOGI(TAG, "graceful close prepared");
-    } else {
-      ESP_LOGW(TAG, "graceful close prepare rejected in phase=%s", phase_name_(phase_now));
+    const bool stage_allowed =
+        this->request_follow_up_token_.load() == 0 &&
+        (phase_now == Phase::THINKING || phase_now == Phase::REPLYING);
+    const GracefulControlContext control = this->graceful_control_context_(
+        message, GracefulControlStage::PREPARE, stage_allowed);
+    const GracefulControlAction action = decide_graceful_control(control);
+    bool accepted = action == GracefulControlAction::ACCEPT;
+    if (action == GracefulControlAction::ACCEPT) {
+      if (this->revoke_followup_("graceful_prepare", false)) {
+        this->graceful_close_owner_session_nonce_ = control.session_nonce;
+        this->graceful_close_owner_wake_generation_ = control.wake_generation;
+        this->graceful_close_prepared_token_ = control.token;
+        ESP_LOGI(TAG, "graceful close prepared");
+      } else {
+        accepted = false;
+        ESP_LOGW(TAG, "graceful close prepare failed during local revocation");
+      }
+    } else if (action == GracefulControlAction::SETTLE_CURRENT) {
+      ESP_LOGW(TAG, "current graceful close prepare rejected in phase=%s",
+               phase_name_(phase_now));
       this->revoke_followup_("graceful_prepare_rejected", true);
+    } else {
+      ESP_LOGW(TAG, "ownerless graceful close prepare ignored in phase=%s",
+               phase_name_(phase_now));
     }
-    this->send_graceful_close_ack_("prepared", token, accepted);
+    this->send_graceful_close_ack_("prepared", control, accepted);
     return;
   }
 
   if (type == "commit_suppress_followup") {
-    uint32_t token = 0;
-    const bool has_token = message.has_exact({"type", "token"}) &&
-                           message.get_uint("token", token) && token != 0;
     const Phase phase_now = static_cast<Phase>(this->current_phase_.load());
-    const bool accepted = has_token &&
-                          this->graceful_close_prepared_token_.load() == token &&
-                          (phase_now == Phase::THINKING || phase_now == Phase::REPLYING);
-    if (accepted) {
+    const bool stage_allowed =
+        phase_now == Phase::THINKING || phase_now == Phase::REPLYING;
+    const GracefulControlContext control = this->graceful_control_context_(
+        message, GracefulControlStage::COMMIT, stage_allowed);
+    const GracefulControlAction action = decide_graceful_control(control);
+    const bool accepted = action == GracefulControlAction::ACCEPT;
+    if (action == GracefulControlAction::ACCEPT) {
       this->graceful_close_prepared_token_ = 0;
-      this->graceful_close_token_ = token;
+      this->graceful_close_token_ = control.token;
       ESP_LOGI(TAG, "graceful close committed");
-    } else {
-      ESP_LOGW(TAG, "graceful close commit rejected in phase=%s", phase_name_(phase_now));
+      // PREPARE revoked lifecycle ownership, so enter terminal idle locally.
+      this->set_phase_("idle");
+    } else if (action == GracefulControlAction::SETTLE_CURRENT) {
+      ESP_LOGW(TAG, "current graceful close commit rejected in phase=%s",
+               phase_name_(phase_now));
       this->revoke_followup_("graceful_commit_rejected", true);
+    } else {
+      ESP_LOGW(TAG, "ownerless graceful close commit ignored in phase=%s",
+               phase_name_(phase_now));
     }
-    this->send_graceful_close_ack_("committed", token, accepted);
+    this->send_graceful_close_ack_("committed", control, accepted);
     return;
   }
 
   if (type == "cancel_suppress_followup") {
-    uint32_t token = 0;
-    this->revoke_followup_("graceful_cancel", false);
-    if (message.has_exact({"type", "token"}) &&
-        message.get_uint("token", token) && token != 0) {
-      if (this->graceful_close_prepared_token_.load() == token)
-        this->graceful_close_prepared_token_ = 0;
-      if (this->graceful_close_token_.load() == token) {
-        this->graceful_close_token_ = 0;
-        this->cancel_timeout("va_graceful_close");
-      }
+    const GracefulControlContext control = this->graceful_control_context_(
+        message, GracefulControlStage::CANCEL, false);
+    const GracefulControlAction action = decide_graceful_control(control);
+    if (action == GracefulControlAction::SETTLE_CURRENT) {
+      this->revoke_followup_("graceful_cancel", false);
       ESP_LOGI(TAG, "graceful close cancelled");
+    } else {
+      ESP_LOGW(TAG, "stale or malformed graceful close cancel ignored");
     }
     return;
   }
@@ -1548,8 +1585,7 @@ void VaClient::apply_phase_side_effects_(
   // Legacy zero mode retains its pre-0.19 barge-in behavior.
   if (phase == "listening") {
     // A genuine new user turn wins over any stale or late model close request.
-    this->graceful_close_prepared_token_ = 0;
-    this->graceful_close_token_ = 0;
+    this->clear_graceful_close_owner_();
     this->cancel_timeout("va_graceful_close");
     ESP_LOGI(TAG, "phase=listening confirmed for current physical owner");
     // Handsfree barge-in cut-over: a `listening` arriving while we still have
@@ -1813,8 +1849,6 @@ uint32_t VaClient::prepare_local_wake() {
 
   this->post_stop_guard_ = false;
   this->suppress_followup_ = false;
-  this->graceful_close_prepared_token_ = 0;
-  this->graceful_close_token_ = 0;
   ESP_LOGI(TAG, "local wake pending with mic closed");
   return wake_reservation;
 }
@@ -2047,8 +2081,6 @@ void VaClient::enroll_start() {
   this->waiting_for_speaker_stop_ = false;
   this->idle_emit_pending_ = false;
   this->suppress_followup_ = false;
-  this->graceful_close_prepared_token_ = 0;
-  this->graceful_close_token_ = 0;
   this->post_stop_guard_ = false;
   this->suppress_incoming_audio_ = false;
   this->preroll_discard_pending_ = true;
@@ -2280,6 +2312,83 @@ bool VaClient::send_interrupt_control_(const char *reason, uint32_t session_nonc
   return sent;
 }
 
+GracefulControlContext VaClient::graceful_control_context_(
+    const FlatJsonObject &message, GracefulControlStage stage,
+    bool stage_allowed) {
+  std::lock_guard<GenerationEffectGate> effect_guard(
+      this->generation_effect_gate_);
+  GracefulControlContext context;
+  context.stage = stage;
+  context.stage_allowed = stage_allowed;
+  const bool token_valid =
+      message.get_uint("token", context.token) && context.token != 0 &&
+      context.token <= kProtocolTokenMax;
+  const bool session_valid =
+      message.get_uint("session_nonce", context.session_nonce) &&
+      context.session_nonce != 0 && context.session_nonce <= kProtocolTokenMax;
+  const bool wake_valid =
+      message.get_uint("wake_generation", context.wake_generation) &&
+      context.wake_generation != 0 &&
+      context.wake_generation <= kProtocolTokenMax;
+  context.message_shape_valid =
+      message.has_exact(
+          {"type", "token", "session_nonce", "wake_generation"}) &&
+      token_valid && session_valid && wake_valid;
+  context.prepared_token = this->graceful_close_prepared_token_.load();
+  context.committed_token = this->graceful_close_token_.load();
+  context.owner_session_nonce =
+      this->graceful_close_owner_session_nonce_.load();
+  context.owner_wake_generation =
+      this->graceful_close_owner_wake_generation_.load();
+  portENTER_CRITICAL(&this->followup_mux_);
+  context.active_session_nonce = this->lifecycle_.session_nonce();
+  context.active_wake_generation = this->lifecycle_.wake_generation();
+  context.active_wake = this->lifecycle_.active_wake();
+  portEXIT_CRITICAL(&this->followup_mux_);
+  return context;
+}
+
+bool VaClient::clear_graceful_close_owner_() {
+  std::lock_guard<GenerationEffectGate> effect_guard(
+      this->generation_effect_gate_);
+  const uint32_t prepared_token =
+      this->graceful_close_prepared_token_.exchange(0);
+  const uint32_t committed_token = this->graceful_close_token_.exchange(0);
+  const uint32_t owner_session_nonce =
+      this->graceful_close_owner_session_nonce_.exchange(0);
+  const uint32_t owner_wake_generation =
+      this->graceful_close_owner_wake_generation_.exchange(0);
+  return prepared_token != 0 || committed_token != 0 ||
+         owner_session_nonce != 0 || owner_wake_generation != 0;
+}
+
+bool VaClient::settle_graceful_close_() {
+  std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
+  if (!this->clear_graceful_close_owner_())
+    return false;
+
+  // Burn ownership before cancelling the callback so a callback already queued
+  // on the main loop cannot complete this close after settlement.
+  this->cancel_timeout("va_graceful_close");
+  portENTER_CRITICAL(&this->followup_mux_);
+  this->request_follow_up_token_ = 0;
+  this->request_follow_up_pending_ = false;
+  this->request_follow_up_callback_in_flight_ = false;
+  this->request_follow_up_callback_token_ = 0;
+  this->request_follow_up_callback_session_nonce_ = 0;
+  this->followup_pending_ = false;
+  this->waiting_for_speaker_stop_ = false;
+  this->followup_armed_ = false;
+  this->idle_emit_pending_ = false;
+  this->streaming_ = false;
+  this->lifecycle_.on_phase_idle();
+  portEXIT_CRITICAL(&this->followup_mux_);
+  this->current_phase_.store(static_cast<uint8_t>(Phase::IDLE));
+  ESP_LOGI(TAG, "graceful close revoked; local idle settled");
+  this->fire_phase_led_("idle");
+  return true;
+}
+
 void VaClient::clear_request_follow_up_(bool close_window) {
   std::lock_guard<GenerationEffectGate> effect_guard(this->generation_effect_gate_);
   ControlContext context;
@@ -2322,7 +2431,8 @@ void VaClient::clear_request_follow_up_(bool close_window) {
     if (barrier_clear)
       this->send_mic_flush_(context.session_nonce, context.wake_generation);
   }
-  if (close_window && should_settle_idle)
+  const bool graceful_settled = this->settle_graceful_close_();
+  if (close_window && should_settle_idle && !graceful_settled)
     this->fire_phase_led_("idle");
 }
 
@@ -2591,9 +2701,15 @@ void VaClient::set_announcement_active(bool active) {
   ControlContext context;
   bool revoke = false;
   bool mic_was_open = false;
+  const bool graceful_close_active =
+      this->graceful_close_prepared_token_.load() != 0 ||
+      this->graceful_close_token_.load() != 0 ||
+      this->graceful_close_owner_session_nonce_.load() != 0 ||
+      this->graceful_close_owner_wake_generation_.load() != 0;
   portENTER_CRITICAL(&this->followup_mux_);
   const FollowUpStage stage = this->lifecycle_.follow_up_stage();
-  revoke = this->lifecycle_.mic_open() || stage == FollowUpStage::READY;
+  revoke = graceful_close_active || this->lifecycle_.mic_open() ||
+           stage == FollowUpStage::READY;
   if (revoke) {
     context.session_nonce = this->lifecycle_.session_nonce();
     context.wake_generation = this->lifecycle_.wake_generation();
@@ -2618,15 +2734,13 @@ void VaClient::set_announcement_active(bool active) {
                               context.wake_generation);
 }
 
-void VaClient::send_graceful_close_ack_(const char *stage, uint32_t token, bool accepted) {
+void VaClient::send_graceful_close_ack_(
+    const char *stage, const GracefulControlContext &context, bool accepted) {
   std::string ack = "{\"type\":\"suppress_followup_ack\",\"stage\":\"";
   ack += stage;
-  ack += "\",\"token\":" + std::to_string(token);
-  if (!this->legacy_zero_mode_()) {
-    const ControlContext context = this->control_context_();
-    ack += ",\"session_nonce\":" + std::to_string(context.session_nonce);
-    ack += ",\"wake_generation\":" + std::to_string(context.wake_generation);
-  }
+  ack += "\",\"token\":" + std::to_string(context.token);
+  ack += ",\"session_nonce\":" + std::to_string(context.session_nonce);
+  ack += ",\"wake_generation\":" + std::to_string(context.wake_generation);
   ack += accepted ? ",\"accepted\":true}" : ",\"accepted\":false}";
   this->send_text_bounded_(ack, "suppress_followup_ack");
 }
@@ -2702,6 +2816,8 @@ bool VaClient::mark_followup_ready(uint32_t token, uint32_t session_nonce) {
       ready_nonce != 0 &&
       this->graceful_close_prepared_token_.load() == 0 &&
       this->graceful_close_token_.load() == 0 &&
+      this->graceful_close_owner_session_nonce_.load() == 0 &&
+      this->graceful_close_owner_wake_generation_.load() == 0 &&
       this->followup_ms_.load() == 0 && !this->barge_in_ &&
       this->ws_connected_.load() && !this->enroll_mode_.load() &&
       !this->streaming_.load() && phase_now == Phase::IDLE && ring_empty &&
@@ -2831,8 +2947,6 @@ void VaClient::send_interrupt() {
   // The phase=idle the server is about to send shouldn't open a follow-up
   // mic window — the user said "stop", not "wait for me to keep talking".
   this->suppress_followup_ = true;
-  this->graceful_close_prepared_token_ = 0;
-  this->graceful_close_token_ = 0;
   // Mic gate is now closed: no new turn can begin until a wake. Ignore any
   // `thinking` the backend emits in the meantime — it's the server VAD's
   // end-of-turn for the utterance we just cancelled, not a real new turn.
