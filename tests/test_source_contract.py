@@ -1007,6 +1007,11 @@ class BuildContractTest(unittest.TestCase):
         self.assertIn("Refuse tags and non-resumable releases", publish)
         self.assertIn("resume_draft", publish)
         self.assertIn("targetCommitish", publish)
+        self.assertIn(
+            'gh release view "$VERSION" --json assets --jq',
+            publish,
+        )
+        self.assertNotIn('releases/tags/$VERSION', publish)
         self.assertIn("github-readback", publish)
         self.assertNotIn("--clobber", publish)
         self.assertIn('cmp "$package/$file" "github-readback/$file"', publish)

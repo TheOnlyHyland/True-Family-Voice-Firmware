@@ -192,7 +192,7 @@ jobs:
             SHA256SUMS
             manifest.json
           )
-          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$VERSION" --jq '.assets[].name')
+          existing=$(gh release view "$VERSION" --json assets --jq '.assets[].name')
           test -z "$existing"
           for file in "${files[@]}"; do
             gh release upload "$VERSION" "$package/$file"
