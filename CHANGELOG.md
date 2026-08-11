@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.20.1
+
+- Make accepted `commit_suppress_followup` enter terminal idle locally after
+  PREPARE revokes lifecycle ownership. Silent responses with no audio and
+  responses with queued audio now share the existing speaker-drain and
+  negotiated tail-delay path before the LED returns to idle.
+- Keep the microphone closed and follow-up suppressed throughout graceful
+  close. Ordinary request follow-up, Stop, mute, credentials, and protocol
+  schemas are unchanged.
+- Make revocation of a prepared or committed graceful close deterministic.
+  Mute, Stop, cancellation, rejected or replayed COMMIT, disconnect, and an
+  immediate replacement wake now burn both close tokens, cancel the tail timer,
+  and settle runtime and LED idle without reopening the microphone.
+- Bind graceful close to an exact token, session nonce, and wake generation.
+  PREPARE stores the active wake owner; COMMIT and CANCEL require that complete
+  tuple; PREPARE/COMMIT ACKs echo it. Stale controls are ignored without
+  mutating a replacement wake. This flow requires coordinated backend `0.22.5`.
+- Update immutable package refs, factory metadata, installer links, tests, and
+  release version checks to `0.20.1`.
+
 ## 0.20.0
 
 - Replace the physical-wake one-shot with one PREPARE grant per genuine answer.

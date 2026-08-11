@@ -23,7 +23,7 @@ not expose native Home Assistant or ESPHome management.
    transition.
 4. Subsequent Home Assistant communication uses the encrypted native API and
    subsequent native OTA uploads require the private per-device password.
-5. The immutable `0.20.0` refs do not auto-discover later releases. To update,
+5. The immutable `0.20.1` refs do not auto-discover later releases. To update,
    review a published release, deliberately advance both refs in the local stub
    to that exact tag and compile, or deliberately re-adopt that release's pinned
    stub. The tracked stubs never follow a branch or moving latest reference.
@@ -39,7 +39,7 @@ Rollback is **backend first**. Do not downgrade firmware while backend `0.21.x`
 or `0.22.0` still requires the nonce-bearing `hello_ack`; firmware `0.18.0` and
 older cannot satisfy that admission contract.
 
-1. Keep firmware `0.20.0` installed and restore backend `0.20.6` first.
+1. Keep firmware `0.20.1` installed and restore backend `0.20.6` first.
 2. Restart the still-installed firmware after restoring the backend. Its
    admitted trusted session nonce blocks the nonce-less legacy zero hello until
    restart clears that session.
@@ -55,8 +55,11 @@ older cannot satisfy that admission contract.
 The reverse order is intentionally unsupported. Backend `0.21.x` remains
 compatible only for ordinary physical-wake turns: every explicit follow-up OPEN
 answer receives tokenless progression phases and fails closed. The safe forward
-order is firmware `0.20.0` first, then coordinated backend `0.22.0`; no explicit
+order is firmware `0.20.1` first, then coordinated backend `0.22.0`; no explicit
 follow-up may be enabled before `0.22.0` echoes the current `request_follow_up`
 token on OPEN `listening`, `thinking`, and `replying` while keeping terminal
-`idle` tokenless. The safe rollback order is backend `0.20.6`, restart and verify
-the still-installed firmware in legacy zero mode, then install older firmware.
+`idle` tokenless. Context-bound graceful close must remain disabled until
+backend `0.22.5` sends and validates the exact token, session nonce, and wake
+generation on PREPARE, COMMIT, CANCEL, and the PREPARE/COMMIT ACKs. The safe
+rollback order is backend `0.20.6`, restart and verify the still-installed
+firmware in legacy zero mode, then install older firmware.

@@ -22,7 +22,7 @@ You don't build anything by hand for a normal install — the per-device stub
 [`esphome-builder.static-ip.yaml`](esphome-builder.static-ip.yaml)) pulls
 [`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml) from
 this repo at an immutable release tag, and ESPHome Builder compiles and flashes
-it. A stub pinned to `0.20.0` does not auto-discover later releases. Updating is
+it. A stub pinned to `0.20.1` does not auto-discover later releases. Updating is
 deliberate: review a release, advance both pinned refs in the local stub to that
 exact tag and compile, or deliberately re-adopt the newer release's pinned stub.
 To hack on the firmware itself, point the stub's `packages:` block at your
@@ -82,13 +82,14 @@ The tracked layering is deliberate:
 
 ## Follow-up protocol compatibility
 
-Firmware `0.20.0` keeps ordinary physical-wake turns compatible with backend
+Firmware `0.20.1` keeps ordinary physical-wake turns compatible with backend
 `0.20.6` and backend `0.21.x`. Backend `0.20.6` cannot authorize explicit
 no-wake follow-up. Backend `0.21.x` uses tokenless trusted phases, so every
 explicit follow-up OPEN answer fails closed at its first `listening`, `thinking`,
 or `replying` progression phase. Coordinated backend `0.22.0` is required for
-any explicit follow-up. See [`CHANGELOG.md`](CHANGELOG.md) for the deployment
-order.
+any explicit follow-up. Context-bound graceful close additionally requires
+coordinated backend `0.22.5`. See [`CHANGELOG.md`](CHANGELOG.md) for the
+deployment order.
 
 ### Exact hello schemas
 
@@ -224,6 +225,34 @@ Backend `0.21.x` likewise retains ordinary trusted physical-wake turns, but its
 tokenless OPEN phases make every explicit follow-up fail closed. Backend `0.22.0`
 is required before any explicit follow-up is enabled.
 
+### Context-bound graceful close
+
+Coordinated backend `0.22.5` binds each model-selected graceful close to the
+physical wake that authorized it. PREPARE, COMMIT, and CANCEL use the same exact
+four-key control shape:
+
+```json
+{"type":"prepare_suppress_followup","token":C,"session_nonce":S,"wake_generation":G}
+```
+
+COMMIT and CANCEL replace only the `type` value. PREPARE is accepted only while
+`S` and `G` identify the current active wake. Firmware then stores the complete
+`(C, S, G)` owner tuple before acknowledging PREPARE. COMMIT and CANCEL must
+match that stored tuple exactly. A delayed tuple from an older wake is ignored
+without changing the replacement wake, microphone, phase, or LED.
+
+PREPARE and COMMIT acknowledgements echo the inbound owner tuple exactly:
+
+```json
+{"type":"suppress_followup_ack","stage":"prepared","token":C,"session_nonce":S,"wake_generation":G,"accepted":true}
+```
+
+The COMMIT acknowledgement uses `"stage":"committed"`. Rejected controls echo
+the received values with `"accepted":false`, allowing the backend to discard a
+stale ACK without binding it to the current wake. Owner token, session, and wake
+fields are cleared together on normal completion, cancellation, forced
+settlement, disconnect, and replacement wake.
+
 Trusted `phase=thinking` is the strict single-turn endpoint: firmware closes
 the mic gate, invalidates its send epoch, waits for the bounded send barrier,
 and rejects all further PCM for that turn. The same physical wake generation,
@@ -312,7 +341,7 @@ This remains a RAPID-PILOT LAN protocol over plaintext `ws://`. The nonce,
 generation, and token checks bind state transitions and reject stale/replayed
 controls, but they do not authenticate the peer or provide confidentiality or
 integrity against an active LAN attacker. There is deliberately no HMAC, PSK,
-certificate pinning, or provisioning flow in firmware `0.20.0`.
+certificate pinning, or provisioning flow in firmware `0.20.1`.
 
 The generic factory image contains neither ESPHome native API nor native OTA,
 so there is no unauthenticated native management interval. Secure adoption uses

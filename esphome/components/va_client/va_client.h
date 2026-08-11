@@ -133,7 +133,14 @@ class VaClient : public Component {
   bool send_follow_up_ready_(const FollowUpCredentials &credentials);
   bool send_follow_up_commit_ack_(uint32_t token, uint32_t session_nonce,
                                   uint32_t ready_nonce, bool accepted);
-  void send_graceful_close_ack_(const char *stage, uint32_t token, bool accepted);
+  void send_graceful_close_ack_(const char *stage,
+                                const GracefulControlContext &context,
+                                bool accepted);
+  GracefulControlContext graceful_control_context_(
+      const FlatJsonObject &message, GracefulControlStage stage,
+      bool stage_allowed);
+  bool clear_graceful_close_owner_();
+  bool settle_graceful_close_();
   void clear_request_follow_up_(bool close_window);
   // Mic pre-roll helper (mic-task only, no lock). push appends to the rolling
   // ring while the session is closed; the ring is DISCARDED (not replayed) on
@@ -307,11 +314,13 @@ class VaClient : public Component {
   // doesn't trigger a follow-up mic window. The user explicitly asked us to
   // stop — they don't want the device sitting there listening.
   std::atomic_bool suppress_followup_{false};
-  // Two-phase, token-bound model close, separate from hard Stop. Prepare never
-  // closes anything; a matching commit during the same active turn arms the
-  // token that loop() consumes after the final reply drains.
+  // Two-phase, context-bound model close, separate from hard Stop. PREPARE
+  // closes lifecycle ownership while retaining its exact token/session/wake;
+  // matching COMMIT arms the token loop() consumes after the final reply drains.
   std::atomic_uint32_t graceful_close_prepared_token_{0};
   std::atomic_uint32_t graceful_close_token_{0};
+  std::atomic_uint32_t graceful_close_owner_session_nonce_{0};
+  std::atomic_uint32_t graceful_close_owner_wake_generation_{0};
   // Set by send_interrupt() ("stop" word / barge-in). OpenAI bursts the whole
   // reply faster than real-time, so by the time the user says "stop" the audio
   // is already buffered (backend + our PSRAM) and the backend keeps streaming
