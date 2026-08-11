@@ -18,6 +18,9 @@ using esphome::va_client::FollowUpPhaseCredentialDecision;
 using esphome::va_client::FollowUpRuntimeSnapshot;
 using esphome::va_client::FollowUpStage;
 using esphome::va_client::GenerationEffectGate;
+using esphome::va_client::GracefulControlAction;
+using esphome::va_client::GracefulControlContext;
+using esphome::va_client::GracefulControlStage;
 using esphome::va_client::HelloAdmission;
 using esphome::va_client::MicSendFence;
 using esphome::va_client::PhaseApplyResult;
@@ -37,6 +40,7 @@ using esphome::va_client::kRequestFollowUpMs;
 using esphome::va_client::kWsBinaryMessageMaxBytes;
 using esphome::va_client::decide_follow_up_phase_credential;
 using esphome::va_client::decide_follow_up_runtime;
+using esphome::va_client::decide_graceful_control;
 using esphome::va_client::phase_runtime_action;
 
 static uint32_t start_trusted_wake(FollowUpLifecycle &lifecycle, uint32_t session_nonce) {
