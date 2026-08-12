@@ -2182,9 +2182,9 @@ bool VaClient::send_mic_flush_(uint32_t session_nonce,
   // NOW, at the cut-off, so no reactive clear-on-wake is needed (that disturbed
   // the server VAD and caused garbage commits). This timer only fires when the
   // Legacy inactivity windows cancel their timer on `listening`. The explicit
-  // round deadline intentionally remains armed after speech and may flush a
-  // partial utterance at its absolute 10-second cutoff. Cheap no-op when the
-  // buffer was empty.
+  // round deadline stays armed until a valid speech endpoint closes the mic,
+  // and may flush a partial utterance at its absolute 10-second cutoff. Cheap
+  // no-op when the buffer was empty.
   std::string message = this->legacy_zero_mode_()
                             ? "{\"type\":\"flush\"}"
                             : "{\"type\":\"flush\",\"session_nonce\":" +

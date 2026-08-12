@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.20.2
+
+- Treat the explicit follow-up deadline as a microphone-aperture limit. A valid
+  ordered `listening -> thinking` endpoint closes the microphone and clears the
+  10-second deadline, so model response time cannot cancel an accepted answer.
+- Keep silence, partial speech without an endpoint, malformed phase order, and
+  exact-deadline races fail closed. The independent 120-second whole-session
+  ceiling and all protocol schemas remain unchanged.
+- Update immutable package refs, factory metadata, installer links, tests, and
+  release version checks to `0.20.2`.
+
 ## 0.20.1
 
 - Make accepted `commit_suppress_followup` enter terminal idle locally after

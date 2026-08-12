@@ -2,7 +2,7 @@
 # Per-device stub for the OpenAI Realtime Voice PE firmware.
 #
 # Copy THIS into your ESPHome dashboard ONCE (add/adopt the device, then edit its
-# YAML). It pulls the full firmware from this repo at immutable `0.20.1` refs.
+# YAML). It pulls the full firmware from this repo at immutable `0.20.2` refs.
 # Those refs do not auto-discover later releases.
 #
 #   1. Set `name` / `friendly_name` for your device.
@@ -21,19 +21,19 @@ substitutions:
   api_encryption_key: !secret api_encryption_key
   ota_password: !secret ota_password
 
-# These `0.20.1` refs are immutable input and do not discover later releases.
+# These `0.20.2` refs are immutable input and do not discover later releases.
 # Change both together only after approving a newer exact release tag.
 packages:
   realtime:
     url: https://github.com/TheOnlyHyland/True-Family-Voice-Firmware
-    ref: "0.20.1"
+    ref: "0.20.2"
     files:
       - home-assistant-voice.realtime.yaml
       - home-assistant-voice.adopted.yaml
     refresh: 0s
 
 dashboard_import:
-  package_import_url: github://TheOnlyHyland/True-Family-Voice-Firmware/esphome-builder.dhcp.yaml@0.20.1
+  package_import_url: github://TheOnlyHyland/True-Family-Voice-Firmware/esphome-builder.dhcp.yaml@0.20.2
   import_full_config: false
 
 # --- Fixed (static) IP? -----------------------------------------------------

@@ -22,7 +22,7 @@ You don't build anything by hand for a normal install — the per-device stub
 [`esphome-builder.static-ip.yaml`](esphome-builder.static-ip.yaml)) pulls
 [`home-assistant-voice.realtime.yaml`](home-assistant-voice.realtime.yaml) from
 this repo at an immutable release tag, and ESPHome Builder compiles and flashes
-it. A stub pinned to `0.20.1` does not auto-discover later releases. Updating is
+it. A stub pinned to `0.20.2` does not auto-discover later releases. Updating is
 deliberate: review a release, advance both pinned refs in the local stub to that
 exact tag and compile, or deliberately re-adopt the newer release's pinned stub.
 To hack on the firmware itself, point the stub's `packages:` block at your
@@ -82,7 +82,7 @@ The tracked layering is deliberate:
 
 ## Follow-up protocol compatibility
 
-Firmware `0.20.1` keeps ordinary physical-wake turns compatible with backend
+Firmware `0.20.2` keeps ordinary physical-wake turns compatible with backend
 `0.20.6` and backend `0.21.x`. Backend `0.20.6` cannot authorize explicit
 no-wake follow-up. Backend `0.21.x` uses tokenless trusted phases, so every
 explicit follow-up OPEN answer fails closed at its first `listening`, `thinking`,
@@ -164,13 +164,13 @@ progression phases omit `T`.
    An announcement beginning after READY revokes the transaction.
 7. Successful COMMIT stores an absolute opening deadline 10 seconds later. The
    lifecycle, main loop, mic lease path, trusted phase path, and cooperative
-   timer all check that same deadline, including after the backend reports
-   speech. A delayed timer callback therefore cannot extend the aperture or
-   admit late `thinking`, `replying`, or grant rearm. Mute, Stop, disconnect, new
+   timer all check that same deadline while the microphone is open. A valid
+   ordered `listening -> thinking` endpoint closes the microphone and clears
+   that aperture deadline; response time is then bounded by the separate
+   generation-bound 120-second whole-session ceiling. A delayed timer callback
+   cannot reopen or cancel that endpointed turn. Mute, Stop, disconnect, new
    local wake, late audio, malformed or competing control, failed/partial send,
-   cancellation, and timeout close locally first and cannot reopen it. A separate
-   generation-bound 120-second whole-session ceiling remains armed across ACK,
-   PCM, reply, PREPARE, READY, and OPEN until authoritative session closure.
+   cancellation, and timeout close locally first and cannot reopen it.
 8. Only a bound `OPEN -> listening -> thinking -> replying` transition that
    includes genuine answer speech and the exact current `T` on every progression
    phase creates exactly one PREPARE grant for the next answer. PREPARE consumes
@@ -341,7 +341,7 @@ This remains a RAPID-PILOT LAN protocol over plaintext `ws://`. The nonce,
 generation, and token checks bind state transitions and reject stale/replayed
 controls, but they do not authenticate the peer or provide confidentiality or
 integrity against an active LAN attacker. There is deliberately no HMAC, PSK,
-certificate pinning, or provisioning flow in firmware `0.20.1`.
+certificate pinning, or provisioning flow in firmware `0.20.2`.
 
 The generic factory image contains neither ESPHome native API nor native OTA,
 so there is no unauthenticated native management interval. Secure adoption uses
