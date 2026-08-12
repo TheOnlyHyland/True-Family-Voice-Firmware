@@ -259,12 +259,21 @@ class FollowUpLifecycle {
       this->revoke_wake_();
       return false;
     }
+    if (this->follow_up_stage_ == FollowUpStage::OPEN &&
+        (this->phase_ != PilotPhase::LISTENING ||
+         !this->follow_up_answer_speech_observed_)) {
+      this->revoke_wake_();
+      return false;
+    }
     this->follow_up_answer_endpointed_ =
         this->follow_up_stage_ == FollowUpStage::OPEN && close_mic &&
         this->phase_ == PilotPhase::LISTENING &&
         this->follow_up_answer_speech_observed_;
-    if (close_mic)
+    if (close_mic) {
       this->close_mic_();
+      if (this->follow_up_answer_endpointed_)
+        this->clear_follow_up_deadline_();
+    }
     this->phase_ = PilotPhase::THINKING;
     return true;
   }
@@ -273,6 +282,11 @@ class FollowUpLifecycle {
                           bool *follow_up_window_completed = nullptr) {
     if (!this->base_safe_() || this->post_stop_ || !this->active_wake_ ||
         this->pending_wake_) {
+      this->revoke_wake_();
+      return false;
+    }
+    if (this->follow_up_stage_ == FollowUpStage::OPEN &&
+        !this->follow_up_answer_endpointed_) {
       this->revoke_wake_();
       return false;
     }
@@ -475,10 +489,8 @@ class FollowUpLifecycle {
             follow_up_token, this->credentials_.token);
     if (credential_decision == FollowUpPhaseCredentialDecision::REJECT)
       return {};
-    // The COMMIT deadline remains authoritative through reply admission and
-    // grant rearm, even after thinking has already closed the mic. Check it
-    // before classifying delayed same-session traffic so any scheduled work
-    // that reaches the lifecycle after the cutoff closes the current round.
+    // The COMMIT deadline bounds the open microphone. A valid endpoint clears
+    // it in on_phase_thinking(); traffic arriving before that remains bounded.
     if (this->follow_up_stage_ == FollowUpStage::OPEN &&
         this->follow_up_deadline_reached(now_ms)) {
       return this->make_non_applied_phase_result_(PhaseApplyStatus::EXPIRED,

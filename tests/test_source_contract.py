@@ -20,7 +20,7 @@ class BuildContractTest(unittest.TestCase):
         self.assertIn("realtime: !include home-assistant-voice.realtime.yaml", factory_config)
         self.assertIn("va_client_source: esphome/components", factory_config)
         self.assertIn("name: true-family-voice", factory_config)
-        self.assertIn('firmware_version: "0.20.1"', factory_config)
+        self.assertIn('firmware_version: "0.20.2"', factory_config)
         self.assertIn('va_url: "ws://homeassistant.local:8080/"', factory_config)
         self.assertNotIn("ota_password", factory_config)
         self.assertNotIn("\napi:\n", factory_config)
@@ -29,11 +29,11 @@ class BuildContractTest(unittest.TestCase):
         self.assertNotIn("dashboard_import:", factory_config)
         self.assertNotIn("compile-only", factory_config)
         self.assertIn(
-            'va_client_source: "github://TheOnlyHyland/True-Family-Voice-Firmware@0.20.1"',
+            'va_client_source: "github://TheOnlyHyland/True-Family-Voice-Firmware@0.20.2"',
             realtime,
         )
         self.assertIn("- source: ${va_client_source}", realtime)
-        self.assertIn('version: "0.20.1"', realtime)
+        self.assertIn('version: "0.20.2"', realtime)
 
         compatibility_factory = self.read("home-assistant-voice.factory.yaml")
         self.assertEqual(compatibility_factory, factory_config)
@@ -818,7 +818,7 @@ class BuildContractTest(unittest.TestCase):
             self.assertIn("--no-build-isolation", candidate)
             self.assertIn("requirements-build.txt", candidate)
             self.assertIn("requirements-esphome.txt", candidate)
-            self.assertIn('SOURCE_DATE_EPOCH: "1785888000"', candidate)
+            self.assertIn('SOURCE_DATE_EPOCH: "1786492800"', candidate)
             self.assertIn('TZ: "UTC0"', candidate)
             self.assertIn('LANG: "C"', candidate)
             self.assertIn('LC_ALL: "C"', candidate)
@@ -856,7 +856,7 @@ class BuildContractTest(unittest.TestCase):
         self.assertIn("sha256sum -c -", patch_installer)
         self.assertIn('grep -m1 -Fxq "GNU patch 2.7.6"', patch_installer)
 
-        self.assertEqual(self.read("SOURCE_DATE_EPOCH"), "1785888000\n")
+        self.assertEqual(self.read("SOURCE_DATE_EPOCH"), "1786492800\n")
         self.assertIn('os.environ["SOURCE_DATE_EPOCH"]', patch)
         self.assertIn("-    build_time = int(time.time())", patch)
         self.assertEqual(
@@ -894,7 +894,7 @@ class BuildContractTest(unittest.TestCase):
             text=True,
         )
         self.assertEqual(exported.returncode, 0, exported.stderr)
-        self.assertEqual(exported.stdout, "1785888000|UTC0|C|C|0\n")
+        self.assertEqual(exported.stdout, "1786492800|UTC0|C|C|0\n")
         clean_env["SOURCE_DATE_EPOCH"] = "1"
         mismatch = subprocess.run(
             ["sh", "-c", '. "$ROOT/scripts/deterministic-build-env"'],
@@ -917,7 +917,7 @@ class BuildContractTest(unittest.TestCase):
         pages = self.read(".github/workflows/gh-pages.yml")
         package = self.read("scripts/package-release")
 
-        self.assertEqual(version, "0.20.1")
+        self.assertEqual(version, "0.20.2")
         self.assertIn(f'version: "{version}"', realtime)
         self.assertIn("verify-version", build)
         self.assertNotIn("workflow_dispatch:", build)
@@ -977,16 +977,16 @@ class BuildContractTest(unittest.TestCase):
         self.assertIn("make-channel-manifest", promotion)
 
         exact = subprocess.run(
-            ["sh", str(ROOT / "scripts/verify-version"), "0.20.1"],
+            ["sh", str(ROOT / "scripts/verify-version"), "0.20.2"],
             cwd=ROOT,
             check=False,
             capture_output=True,
             text=True,
         )
         self.assertEqual(exact.returncode, 0, exact.stderr)
-        self.assertEqual(exact.stdout.strip(), "0.20.1")
+        self.assertEqual(exact.stdout.strip(), "0.20.2")
         wrong = subprocess.run(
-            ["sh", str(ROOT / "scripts/verify-version"), "v0.20.1"],
+            ["sh", str(ROOT / "scripts/verify-version"), "v0.20.2"],
             cwd=ROOT,
             check=False,
             capture_output=True,
@@ -1099,7 +1099,7 @@ class BuildContractTest(unittest.TestCase):
             self.assertNotIn("ref: main", source)
         issue_config = self.read(".github/ISSUE_TEMPLATE/config.yml")
         self.assertIn(
-            "TheOnlyHyland/True-Family-Voice-Firmware/blob/0.20.1/INSTALL.md",
+            "TheOnlyHyland/True-Family-Voice-Firmware/blob/0.20.2/INSTALL.md",
             issue_config,
         )
         self.assertNotIn("/blob/main/", issue_config)

@@ -535,8 +535,12 @@ static void test_complete_two_phase_lifecycle() {
   assert(lifecycle.follow_up_deadline_remaining_ms(kOpenedAtMs + 1) ==
          kRequestFollowUpMs - 1);
   assert(apply_follow_up_phase(
-             lifecycle, PilotPhase::REPLYING, 7001, wake_generation, 9001,
+             lifecycle, PilotPhase::THINKING, 7001, wake_generation, 9001,
              kOpenedAtMs + 2)
+             .status == PhaseApplyStatus::APPLIED);
+  assert(apply_follow_up_phase(
+             lifecycle, PilotPhase::REPLYING, 7001, wake_generation, 9001,
+             kOpenedAtMs + 3)
              .status == PhaseApplyStatus::APPLIED);
   lifecycle.on_phase_idle();
   assert(!lifecycle.active_wake());
@@ -725,7 +729,7 @@ static void complete_serialized_follow_up_round(
              lifecycle, PilotPhase::LISTENING, session_nonce,
              wake_generation, token, opened_at_ms + 1)
              .status == PhaseApplyStatus::APPLIED);
-  // Genuine speech does not turn the aperture deadline into an inactivity timer.
+  // Speech start alone does not cancel the deadline; a valid endpoint does.
   assert(lifecycle.follow_up_deadline_remaining_ms(opened_at_ms + 1) ==
          kRequestFollowUpMs - 1);
   assert(!lifecycle.per_answer_grant_available());
@@ -733,6 +737,7 @@ static void complete_serialized_follow_up_round(
              lifecycle, PilotPhase::THINKING, session_nonce, wake_generation,
              token, opened_at_ms + 2)
              .status == PhaseApplyStatus::APPLIED);
+  assert(lifecycle.follow_up_deadline_remaining_ms(opened_at_ms + 2) == 0);
   assert(!lifecycle.per_answer_grant_available());
   assert(apply_follow_up_phase(
              lifecycle, PilotPhase::REPLYING, session_nonce, wake_generation,
@@ -862,7 +867,7 @@ static void test_tokenized_idle_is_invalid_and_tokenless_idle_is_terminal() {
       kToken, kSessionNonce, 31101, 0, 1000));
 
   // Backend 0.21.x sends tokenless progression and therefore cannot complete
-  // any explicit OPEN answer with firmware 0.20.1.
+  // any explicit OPEN answer with firmware 0.20.2.
   for (const PilotPhase target : std::array<PilotPhase, 3>{
            PilotPhase::LISTENING,
            PilotPhase::THINKING,
@@ -894,7 +899,7 @@ static void test_tokenized_idle_is_invalid_and_tokenless_idle_is_terminal() {
   assert(!lifecycle.mic_open());
 }
 
-static void test_commit_deadline_is_absolute_and_wrap_safe() {
+static void test_commit_deadline_bounds_the_open_mic_and_is_wrap_safe() {
   FollowUpLifecycle late_thinking;
   const uint32_t thinking_wake = start_trusted_wake(late_thinking, 9020);
   assert(late_thinking.on_phase_replying());
@@ -941,14 +946,15 @@ static void test_commit_deadline_is_absolute_and_wrap_safe() {
              22002, 2002)
              .status == PhaseApplyStatus::APPLIED);
   assert(!late_replying.mic_open());
+  assert(late_replying.follow_up_deadline_remaining_ms(2002) == 0);
   assert(apply_follow_up_phase(
              late_replying, PilotPhase::REPLYING, 9021, replying_wake,
              22002, 12000)
-             .status == PhaseApplyStatus::EXPIRED);
-  assert(!late_replying.per_answer_grant_available());
-  assert(late_replying.expire_follow_up_deadline(
+             .status == PhaseApplyStatus::APPLIED);
+  assert(!late_replying.expire_follow_up_deadline(
       12000, replying_wake, 22002));
-  assert(!late_replying.active_wake());
+  assert(late_replying.per_answer_grant_available());
+  assert(late_replying.active_wake());
 
   FollowUpLifecycle wrapped;
   const uint32_t wrapped_wake = start_trusted_wake(wrapped, 9022);
@@ -982,11 +988,8 @@ static void test_only_ordered_answer_speech_rearms_a_round() {
   assert(apply_follow_up_phase(
              no_speech, PilotPhase::THINKING, 9050, no_speech_wake, 9051,
              1001)
-             .status == PhaseApplyStatus::APPLIED);
-  assert(apply_follow_up_phase(
-             no_speech, PilotPhase::REPLYING, 9050, no_speech_wake, 9051,
-             1002)
-             .status == PhaseApplyStatus::APPLIED);
+             .status == PhaseApplyStatus::REJECTED);
+  assert(!no_speech.active_wake());
   assert(!no_speech.per_answer_grant_available());
 
   FollowUpLifecycle no_endpoint;
@@ -1004,7 +1007,8 @@ static void test_only_ordered_answer_speech_rearms_a_round() {
   assert(apply_follow_up_phase(
              no_endpoint, PilotPhase::REPLYING, 9060, no_endpoint_wake,
              9061, 1002)
-             .status == PhaseApplyStatus::APPLIED);
+             .status == PhaseApplyStatus::REJECTED);
+  assert(!no_endpoint.active_wake());
   assert(!no_endpoint.per_answer_grant_available());
 
   FollowUpLifecycle cancelled;
@@ -1622,7 +1626,7 @@ int main() {
   test_bounded_serialized_round_history_fails_closed_and_resets();
   test_stale_prior_round_phase_credentials_cannot_progress_open();
   test_tokenized_idle_is_invalid_and_tokenless_idle_is_terminal();
-  test_commit_deadline_is_absolute_and_wrap_safe();
+  test_commit_deadline_bounds_the_open_mic_and_is_wrap_safe();
   test_only_ordered_answer_speech_rearms_a_round();
   test_ready_nonce_replay_and_mismatch();
   test_stale_ready_callback_cannot_touch_new_wake();
